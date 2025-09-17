@@ -89,7 +89,7 @@ where
             Option<ClearedSparseStateTrie<ConfiguredSparseTrie, ConfiguredSparseTrie>>,
         >,
     >,
-    /// Whether to use the parallel sparse trie.
+    /// Whether to disable the parallel sparse trie.
     disable_parallel_sparse_trie: bool,
     /// A cleared trie input, kept around to be reused so allocations can be minimized.
     trie_input: Option<TrieInput>,
@@ -548,9 +548,14 @@ impl ExecutionCache {
         self.inner.write().take();
     }
 
-    /// Stores the provider cache
-    pub(crate) fn save_cache(&self, cache: SavedCache) {
-        self.inner.write().replace(cache);
+    /// Updates the cache with a closure that has exclusive access to the guard.
+    /// This ensures that all cache operations happen atomically.
+    pub(crate) fn update_with_guard<F>(&self, update_fn: F)
+    where
+        F: FnOnce(&mut Option<SavedCache>),
+    {
+        let mut guard = self.inner.write();
+        update_fn(&mut guard);
     }
 }
 
