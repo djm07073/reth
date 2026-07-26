@@ -1,0 +1,11 @@
+{
+  "schema_version": "reth-fpga-cp1-snapshot-inventory/v1",
+  "logical_identity": "reth-v2.0.0-mainnet-through-20999999",
+  "files": [
+    {
+      "path": "db/mdbx.dat",
+      "bytes": 0,
+      "sha256": "<file-sha256>"
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "schema_version": "reth-fpga-cp1-replay-manifest/v1",
+  "contract": {
+    "path": "../experiment-contract/v1/manifest.json",
+    "sha256": "bb10341f63c54ee5c75270d2bb0d54a8d9a8ac817512cbe63717493532b8f58e"
+  },
+  "source": {
+    "path": "/absolute/path/to/pinned/reth-v2.0.0",
+    "commit": "eb4c15e5e36d8776d46629beae4c0a69af7ab04f",
+    "cargo_lock_sha256": "c43cfd1ec673a6b8a9ed92d70b3ccc767759ff92bc5819fbffe6e1f2d2d5210e",
+    "rustc_verbose_version_sha256": "<sha256-of-rustc-+1.93.0--vV-output>",
+    "rust_toolchain": "1.93.0",
+    "profile": "maxperf",
+    "rustflags": "-C target-cpu=native"
+  },
+  "binaries": {
+    "reth": {
+      "path": "/absolute/path/to/pinned/reth-v2.0.0/target/maxperf/reth",
+      "sha256": "<reth-binary-sha256>",
+      "build_command": "RUSTFLAGS='-C target-cpu=native' cargo +1.93.0 build --locked --profile maxperf --package reth --bin reth"
+    },
+    "reth_bench": {
+      "path": "/absolute/path/to/pinned/reth-v2.0.0/target/maxperf/reth-bench",
+      "sha256": "<reth-bench-binary-sha256>",
+      "build_command": "RUSTFLAGS='-C target-cpu=native' cargo +1.93.0 build --locked --profile maxperf --package reth-bench --bin reth-bench"
+    }
+  },
+  "corpus": {
+    "path": "/absolute/read-only/path/corpus.jsonl",
+    "lock_path": "/absolute/read-only/path/corpus-lock.json",
+    "lock_sha256": "d79717b912aeb0826c06448fad1811dae7a65f824349890279a6a22c9b8f9b68",
+    "artifact_sha256": "d7e91e27d946659e678da4d970c9c059d75bae11ea9addec22cbd043b56a7c96",
+    "ordered_block_hashes_sha256": "0c67edbed2dd6c42a0f1cb684800fd1d6de213f8bf0011722f59758467989280",
+    "fixture_server_sha256": "afb6b25c1865a2d6b031d9a367b35d50220b5199483a0abbd48d8be470dcae49"
+  },
+  "snapshot": {
+    "path": "/absolute/read-only/path/reth-mainnet-20999999.tar.zst",
+    "format": "reth-datadir-tar-zstd",
+    "logical_identity": "reth-v2.0.0-mainnet-through-20999999",
+    "artifact_sha256": "<snapshot-artifact-sha256>",
+    "bytes": 0,
+    "inventory_path": "/absolute/read-only/path/snapshot-inventory.json",
+    "inventory_sha256": "<snapshot-inventory-sha256>",
+    "required_paths": [
+      "db/mdbx.dat",
+      "static_files"
+    ],
+    "minimum_free_bytes_after_restore": 1073741824
+  },
+  "chain": {
+    "id": 1,
+    "name": "mainnet"
+  },
+  "anchor": {
+    "number": 20999999,
+    "hash": "0x215f1fa046ff46999f1a91973d7cc39c6d4e7aa64d3de3a40d31591f543c3386",
+    "state_root": "0x07af1aec143b8db461d441f2916f4a1ab34f294c1be98b7da917ad3c513d9e87"
+  },
+  "replay": {
+    "from": 21000000,
+    "to": 21000007,
+    "payloads": 8
+  },
+  "timeouts_seconds": {
+    "node_ready": 120,
+    "replay": 600,
+    "process_stop": 20
+  }
+}
