@@ -1,0 +1,342 @@
+{
+  "schema_version": "reth-fpga-experiment-contract/v1",
+  "contract_id": "reth-2.0-fpga-cp0-v1",
+  "goal_stage": "SC-01",
+  "success_criterion": "SC-01.1",
+  "paid_resource_policy": {
+    "aws_f1_launch_allowed": false,
+    "other_paid_resource_launch_allowed": false,
+    "approval_requirement": "separate explicit human approval"
+  },
+  "software": {
+    "source_repository": "https://github.com/djm07073/reth",
+    "upstream_repository": "https://github.com/paradigmxyz/reth",
+    "upstream_release": "v2.0.0",
+    "upstream_release_ref": "refs/tags/v2.0.0",
+    "reth_commit": "eb4c15e5e36d8776d46629beae4c0a69af7ab04f",
+    "reth_bench_commit": "eb4c15e5e36d8776d46629beae4c0a69af7ab04f",
+    "reth_bench_package": "bin/reth-bench",
+    "workload_command": "new-payload-fcu",
+    "rust_version": "1.93.0",
+    "cargo_locked": true,
+    "cargo_lock_sha256": "c43cfd1ec673a6b8a9ed92d70b3ccc767759ff92bc5819fbffe6e1f2d2d5210e",
+    "build_profile": "maxperf",
+    "rustflags": "-C target-cpu=native",
+    "allocator": "jemalloc",
+    "instrumented_build_profile": "profiling",
+    "build_commands": {
+      "reth": "RUSTFLAGS='-C target-cpu=native' cargo +1.93.0 build --locked --profile maxperf --package reth --bin reth",
+      "reth_bench": "RUSTFLAGS='-C target-cpu=native' cargo +1.93.0 build --locked --profile maxperf --package reth-bench --bin reth-bench"
+    },
+    "binary_lock_fields": [
+      "source_commit",
+      "cargo_lock_sha256",
+      "rustc_verbose_version",
+      "command",
+      "binary_sha256"
+    ]
+  },
+  "workload": {
+    "chain": "ethereum-mainnet",
+    "chain_id": 1,
+    "snapshot_head": {
+      "number": 20999999,
+      "hash": "0x215f1fa046ff46999f1a91973d7cc39c6d4e7aa64d3de3a40d31591f543c3386",
+      "state_root": "0x07af1aec143b8db461d441f2916f4a1ab34f294c1be98b7da917ad3c513d9e87"
+    },
+    "warmup": {
+      "from": 21000000,
+      "to": 21000099,
+      "blocks": 100,
+      "first_block_hash": "0xf5e1d15a3e380006bd271e73c8eeed75fafc3ae6942b16f63c21361079bba709",
+      "last_block_hash": "0x4334aa15d92a15a71b774326d0df1d0e6d2b661d2ee1a40f04621cf3b3349b13",
+      "include_in_statistics": false
+    },
+    "measurement": {
+      "from": 21000100,
+      "to": 21000599,
+      "blocks": 500,
+      "first_block_hash": "0x4ca0bd7a1fab8b5da43ebb8c619bae4446759c75f0b80973f5bbaf11436c3010",
+      "last_block_hash": "0x6ca70a9975d03fdf2e262c72eb3ced0a035a44639d5cc78900efd1df510d654b",
+      "last_state_root": "0x530b35d159463877116e432a9824b4e3dbbfadbcccc7ab4880368a203f8e4db5"
+    },
+    "payload_source": {
+      "format": "read-only-loopback-json-rpc-fixture",
+      "canonical_identity": "ethereum-mainnet:20999936-21000599",
+      "from": 20999936,
+      "to": 21000599,
+      "reason_for_lookback": "The first replayed block needs canonical safe and finalized headers at N-32 and N-64.",
+      "served_methods": [
+        "eth_getBlockByNumber"
+      ],
+      "network_fetch_during_measured_run": false,
+      "required_lock_fields": [
+        "artifact_sha256",
+        "ordered_block_hashes_sha256",
+        "fixture_server_sha256",
+        "bytes"
+      ]
+    },
+    "snapshot": {
+      "format": "reth-datadir-tar-zstd",
+      "logical_identity": "reth-v2.0.0-mainnet-through-20999999",
+      "restore_before_each_run": true,
+      "read_only_source": true,
+      "required_lock_fields": [
+        "artifact_sha256",
+        "unpacked_manifest_sha256",
+        "bytes"
+      ]
+    },
+    "engine_sequence": [
+      "newPayload",
+      "forkchoiceUpdated"
+    ],
+    "range_semantics": "`reth-bench v2.0.0 --from` is the already-canonical anchor; replay begins at anchor + 1.",
+    "commands": {
+      "live_sync_warmup": "reth-bench new-payload-fcu --rpc-url http://127.0.0.1:<corpus_rpc_port> --engine-rpc-url http://127.0.0.1:8551 --jwt-secret <jwt_secret_path> --rpc-block-fetch-retries 0 --from 20999999 --to 21000099 --output artifacts/<run_id>/warmup",
+      "persistence_warmup": "reth-bench new-payload-fcu --rpc-url http://127.0.0.1:<corpus_rpc_port> --engine-rpc-url http://127.0.0.1:8551 --jwt-secret <jwt_secret_path> --rpc-block-fetch-retries 0 --reth-new-payload --wait-for-persistence always --from 20999999 --to 21000099 --output artifacts/<run_id>/warmup",
+      "live_sync_measurement": "reth-bench new-payload-fcu --rpc-url http://127.0.0.1:<corpus_rpc_port> --engine-rpc-url http://127.0.0.1:8551 --jwt-secret <jwt_secret_path> --rpc-block-fetch-retries 0 --from 21000099 --to 21000599 --output artifacts/<run_id>/reth-bench",
+      "persistence_measurement": "reth-bench new-payload-fcu --rpc-url http://127.0.0.1:<corpus_rpc_port> --engine-rpc-url http://127.0.0.1:8551 --jwt-secret <jwt_secret_path> --rpc-block-fetch-retries 0 --reth-new-payload --wait-for-persistence always --from 21000099 --to 21000599 --output artifacts/<run_id>/reth-bench",
+      "runtime_arguments": "Resolved loopback ports and a redacted JWT path are recorded in commands.jsonl; JWT contents are never recorded."
+    },
+    "modes": [
+      {
+        "name": "live-sync",
+        "new_payload_method": "engine_newPayload",
+        "wait_for_persistence_per_batch": false,
+        "wait_for_persistence_at_run_end": true
+      },
+      {
+        "name": "wait-for-persistence",
+        "new_payload_method": "reth_newPayload",
+        "wait_for_persistence_per_batch": true,
+        "wait_policy": "always"
+      }
+    ],
+    "completion_condition": {
+      "last_payload_status": "VALID",
+      "canonical_head_number": 21000599,
+      "persisted_block_at_least": 21000599,
+      "all_async_queues_drained": true,
+      "database_sync_completed": true,
+      "timing_end": "After persisted-block >= 21000599, all accelerator queues are drained and sync -f /mnt/reth-bench/reth returns 0.",
+      "failure_rule": "A timeout, non-VALID payload, mismatched oracle field, undrained queue, or failed sync invalidates the run."
+    }
+  },
+  "environment": {
+    "comparison_host": {
+      "provider": "AWS",
+      "region": "us-east-1",
+      "instance_type": "f1.2xlarge",
+      "vcpu_count": 8,
+      "memory_gib": 122,
+      "fpga_device_count": 1,
+      "same_instance_for_pair": true,
+      "baseline_fpga_state": "device-disabled-no-runtime-loaded",
+      "candidate_fpga_state": "runtime-loaded-if-approved",
+      "required_lock_fields": [
+        "instance_id",
+        "availability_zone",
+        "cpu_model",
+        "microcode",
+        "memory_bytes",
+        "fpga_slot_ids"
+      ]
+    },
+    "operating_system": {
+      "distribution": "Ubuntu 22.04 LTS",
+      "architecture": "x86_64",
+      "kernel_family": "5.15.0-aws",
+      "same_boot_for_pair": true,
+      "required_lock_fields": [
+        "ami_id",
+        "image_digest",
+        "uname_release",
+        "kernel_package",
+        "kernel_build",
+        "boot_id"
+      ]
+    },
+    "cpu": {
+      "cpuset": "0-7",
+      "governor": "performance",
+      "smt_policy": "unchanged-and-identical-within-pair",
+      "frequency_policy": "unchanged-and-identical-within-pair",
+      "numa_policy": "local",
+      "background_services": "benchmark-allowlist-only"
+    },
+    "storage": {
+      "device_class": "local-NVMe-instance-store",
+      "device_count": 1,
+      "nominal_capacity_gb": 470,
+      "filesystem": "ext4",
+      "mount_options": "defaults,noatime",
+      "database_path": "/mnt/reth-bench/reth",
+      "artifact_path": "/mnt/reth-bench/artifacts",
+      "free_space_min_bytes": 107374182400,
+      "scheduler": "none",
+      "read_ahead_kib": 128,
+      "fit_gate": "Before an admissible run, the restored snapshot plus the free-space minimum must fit; otherwise revise the contract to a larger F1 host without launching this host.",
+      "required_lock_fields": [
+        "device_model",
+        "device_bytes",
+        "filesystem_uuid",
+        "mount_options",
+        "scheduler",
+        "read_ahead_kib"
+      ]
+    },
+    "cache_states": [
+      {
+        "name": "cold",
+        "procedure": "restore snapshot; start reth; replay the fixed 100-block warmup; wait for persistence; stop reth; sync; drop host page cache; restart reth; begin measurement"
+      },
+      {
+        "name": "warm",
+        "procedure": "restore snapshot; start reth; replay the fixed 100-block warmup exactly once; wait for persistence; begin measurement without restart or cache eviction"
+      }
+    ],
+    "run_lock_path": "artifacts/<run_id>/environment-lock.json",
+    "run_lock_rule": "Every required_lock_field and tool version must be concrete; a pair is invalid unless immutable fields match."
+  },
+  "repetition": {
+    "comparison_cells": {
+      "modes": [
+        "live-sync",
+        "wait-for-persistence"
+      ],
+      "cache_states": [
+        "cold",
+        "warm"
+      ]
+    },
+    "independent_pairs_per_cell": 6,
+    "pair_orders": [
+      "CPU-FPGA",
+      "FPGA-CPU",
+      "CPU-FPGA",
+      "FPGA-CPU",
+      "CPU-FPGA",
+      "FPGA-CPU"
+    ],
+    "snapshot_restore_between_runs": true,
+    "cooldown_condition": "NVMe temperature <= pair-start temperature + 2C and CPU package temperature stable for 60s",
+    "random_seed": 2000000
+  },
+  "statistics": {
+    "primary_unit": "paired-run",
+    "report": [
+      "mean",
+      "median",
+      "p50",
+      "p90",
+      "p95",
+      "p99",
+      "sample_variance",
+      "95%_paired_bootstrap_confidence_interval"
+    ],
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 2000000,
+    "outlier_policy": "report-all-no-exclusion; diagnose separately",
+    "minimum_valid_pairs": 6,
+    "primary_success_cell": {
+      "mode": "wait-for-persistence",
+      "cache_state": "warm",
+      "metric": "e2e_wall_clock"
+    },
+    "success_threshold": {
+      "minimum_median_improvement_percent": 25,
+      "target_median_improvement_percent": 50,
+      "confidence_rule": "The 95% paired bootstrap confidence interval for improvement must exclude zero.",
+      "correctness_required": true
+    },
+    "performance_no_regression": {
+      "scope": "all non-primary mode/cache-state cells",
+      "maximum_median_e2e_degradation_percent": 3,
+      "p95": "report and investigate every degradation; no exclusion is allowed"
+    }
+  },
+  "comparison": {
+    "same_reth_bench_binary_sha256": true,
+    "same_payload_corpus_sha256": true,
+    "same_snapshot_sha256": true,
+    "same_cache_state": true,
+    "same_build_profile_and_rustflags": true,
+    "candidate_boundary_includes": [
+      "FPGA runtime",
+      "PCIe/DMA",
+      "serialization",
+      "queueing",
+      "synchronization",
+      "CPU orchestration",
+      "timeout",
+      "CPU fallback"
+    ],
+    "required_modes": [
+      "live-sync",
+      "wait-for-persistence"
+    ]
+  },
+  "correctness": {
+    "per_payload_status": "VALID",
+    "compare_fields": [
+      "latestValidHash",
+      "canonical block hash",
+      "execution result",
+      "receipts root",
+      "state root"
+    ],
+    "final_block_hash": "0x6ca70a9975d03fdf2e262c72eb3ced0a035a44639d5cc78900efd1df510d654b",
+    "final_state_root": "0x530b35d159463877116e432a9824b4e3dbbfadbcccc7ab4880368a203f8e4db5",
+    "cpu_only_regression": "Uninstrumented CPU-only output must byte-match the pinned oracle fields.",
+    "fallback": {
+      "required": true,
+      "trigger_cases": [
+        "FPGA unavailable",
+        "queue full",
+        "timeout",
+        "device error",
+        "result validation failure"
+      ],
+      "behavior": "atomically discard accelerator result and execute the same operation on CPU",
+      "crash_safety": "FPGA path never owns canonical durability; restart replays from the last committed Reth state"
+    }
+  },
+  "instrumentation": {
+    "metric_inventory": "metrics.csv",
+    "reth_pr_evidence": "reth-evidence.csv",
+    "primary_run_overhead_budget_percent": 3.0,
+    "overhead_protocol": "paired instrumentation-off/on runs using the same restored snapshot",
+    "high_frequency_policy": "If E2E median overhead exceeds 3%, move the metric to a separate sampled instrumented run."
+  },
+  "artifacts": {
+    "root": "artifacts/<run_id>",
+    "run_id_format": "YYYYMMDDTHHMMSSZ-<git12>-<live-sync|wait-for-persistence>-<cpu|fpga>-<cold|warm>-r<01..06>",
+    "required": [
+      "manifest.json",
+      "environment-lock.json",
+      "corpus-lock.json",
+      "snapshot-lock.json",
+      "commands.jsonl",
+      "correctness.json",
+      "summary.json",
+      "logs/reth.jsonl",
+      "logs/reth-bench.jsonl",
+      "reth-bench/combined_latency.csv",
+      "reth-bench/total_gas.csv",
+      "metrics/application.jsonl",
+      "metrics/kernel.csv",
+      "metrics/mdbx.jsonl",
+      "metrics/trie.jsonl",
+      "metrics/fpga.jsonl",
+      "profiles/perf.data",
+      "checksums.sha256"
+    ],
+    "secrets_forbidden": [
+      "JWT secret",
+      "cloud credentials",
+      "private endpoints"
+    ]
+  }
+}

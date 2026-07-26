@@ -1,0 +1,74 @@
+metric_id,layer,source,unit,sampling,expected_overhead,artifact_path,run_class
+engine_new_payload_latency,application,reth tracing span,nanoseconds,every call,<0.3%,metrics/application.jsonl,primary
+engine_fcu_latency,application,reth tracing span,nanoseconds,every call,<0.2%,metrics/application.jsonl,primary
+validation_latency,application,reth tracing span,nanoseconds,every call,<0.2%,metrics/application.jsonl,primary
+signature_recovery_latency,application,reth tracing span,nanoseconds,every block,<0.2%,metrics/application.jsonl,primary
+evm_execution_latency,application,reth tracing span,nanoseconds,every block,<0.3%,metrics/application.jsonl,primary
+state_root_latency,application,reth tracing span,nanoseconds,every block,<0.3%,metrics/application.jsonl,primary
+save_blocks_latency,application,reth tracing span,nanoseconds,every persistence batch,<0.2%,metrics/application.jsonl,primary
+persistence_wait,application,reth subscription timestamps,nanoseconds,every persistence wait,<0.1%,metrics/application.jsonl,primary
+persistence_backpressure,application,reth engine backpressure counter,count and nanoseconds,every backpressure event aggregated 1s,<0.2%,metrics/application.jsonl,primary
+worker_wait,application,tokio/reth task instrumentation,nanoseconds,per-thread aggregation 1s,<0.3%,metrics/application.jsonl,primary
+worker_idle,application,tokio/reth task instrumentation,ratio,per-thread aggregation 1s,<0.2%,metrics/application.jsonl,primary
+block_gas,application,reth-bench output,gas,every block,negligible,metrics/application.jsonl,primary
+throughput,application,reth-bench output,Mgas/s,every block and run,negligible,summary.json,primary
+e2e_wall_clock,application,CLOCK_MONOTONIC_RAW,nanoseconds,every run,negligible,summary.json,primary
+mdbx_txn_open,mdbx,libmdbx wrapper counter,count and nanoseconds,per-thread aggregation 1s,<0.2%,metrics/mdbx.jsonl,primary
+mdbx_txn_close,mdbx,libmdbx wrapper counter,count and nanoseconds,per-thread aggregation 1s,<0.2%,metrics/mdbx.jsonl,primary
+mdbx_txn_commit,mdbx,libmdbx wrapper span,count and nanoseconds,every write transaction,<0.3%,metrics/mdbx.jsonl,primary
+mdbx_txn_abort,mdbx,libmdbx wrapper counter,count,per-thread aggregation 1s,<0.1%,metrics/mdbx.jsonl,primary
+mdbx_commit_prepare,mdbx,libmdbx probe,nanoseconds,sampled 1:16,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_commit_gc,mdbx,libmdbx probe,nanoseconds,sampled 1:16,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_commit_audit,mdbx,libmdbx probe,nanoseconds,sampled 1:16,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_commit_write,mdbx,libmdbx probe,nanoseconds,sampled 1:16,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_commit_sync,mdbx,libmdbx probe,nanoseconds,sampled 1:16,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_table_operations,mdbx,reth database wrapper,count by table/op,per-thread aggregation 1s,<0.5%,metrics/mdbx.jsonl,primary
+mdbx_operation_mix,mdbx,reth database wrapper,GET/PUT/DELETE/SEEK/NEXT count plus read/write ratio,per-thread aggregation 1s,<0.5%,metrics/mdbx.jsonl,primary
+mdbx_scan_shape,mdbx,reth database wrapper,scan count and operations/scan,sampled 1:1024 cursor sequences,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_dependency_chain,mdbx,reth database sampled trace,operation dependency edges and nanoseconds,sampled 1:1024 operations,<1.0%,metrics/mdbx.jsonl,instrumented
+mdbx_key_value_size,mdbx,reth database wrapper,key/value bytes histogram,sampled 1:1024 ops,<0.5%,metrics/mdbx.jsonl,instrumented
+mdbx_cursor_open,mdbx,reth database wrapper,count,per-thread aggregation 1s,<0.2%,metrics/mdbx.jsonl,primary
+mdbx_cursor_seek,mdbx,reth database wrapper,count and nanoseconds,per-thread aggregation 1s,<0.4%,metrics/mdbx.jsonl,primary
+mdbx_cursor_next,mdbx,reth database wrapper,count and nanoseconds,per-thread aggregation 1s,<0.4%,metrics/mdbx.jsonl,primary
+mdbx_cursor_reposition,mdbx,reth database wrapper,count,per-thread aggregation 1s,<0.2%,metrics/mdbx.jsonl,primary
+mdbx_cursor_reuse,mdbx,reth database wrapper,ratio,per-thread aggregation 1s,<0.2%,metrics/mdbx.jsonl,primary
+mdbx_btree_depth,mdbx,MDBX page trace,levels,sampled 1:1024 ops,<1.0%,metrics/mdbx.jsonl,instrumented
+mdbx_pages_per_op,mdbx,MDBX page trace,pages,sampled 1:1024 ops,<1.0%,metrics/mdbx.jsonl,instrumented
+mdbx_hot_cold_pages,mdbx,page-id reuse sketch,count and ratio,sampled 1:1024 ops,<1.0%,metrics/mdbx.jsonl,instrumented
+mdbx_dirty_pages,mdbx,MDBX info/stat,pages,1 Hz,<0.1%,metrics/mdbx.jsonl,primary
+mdbx_flush,mdbx,MDBX info plus kernel writeback,bytes and nanoseconds,1 Hz,<0.1%,metrics/mdbx.jsonl,primary
+mdbx_lock_wait,mdbx,uprobes plus off-CPU stacks,nanoseconds,sampled 99 Hz,<1.0%,metrics/mdbx.jsonl,instrumented
+trie_traversal,trie,reth trie span,count and nanoseconds,every block,<0.3%,metrics/trie.jsonl,primary
+trie_proof,trie,reth trie span,count and nanoseconds,every block,<0.3%,metrics/trie.jsonl,primary
+trie_hashing,trie,reth trie counter,count and nanoseconds,per-thread aggregation 1s,<0.3%,metrics/trie.jsonl,primary
+trie_nodes,trie,reth trie counter,branch/extension/leaf count,every block,<0.2%,metrics/trie.jsonl,primary
+trie_key_value_size,trie,reth trie sampled event,bytes,sampled 1:1024 nodes,<0.5%,metrics/trie.jsonl,instrumented
+trie_dependency_chain,trie,reth trie sampled trace,node dependency edges and nanoseconds,sampled 1:1024 nodes,<1.0%,metrics/trie.jsonl,instrumented
+cpu_time,kernel,perf stat,user/system seconds,per run,<0.5%,metrics/kernel.csv,primary
+cycles,kernel,perf stat,count,per run,<0.5%,metrics/kernel.csv,primary
+instructions_ipc,kernel,perf stat,count and ratio,per run,<0.5%,metrics/kernel.csv,primary
+branches_misses,kernel,perf stat,count and ratio,per run,<0.5%,metrics/kernel.csv,primary
+cache_llc_misses,kernel,perf stat,count and ratio,per run,<0.5%,metrics/kernel.csv,primary
+memory_bandwidth,kernel,perf uncore or pcm,bytes/second,1 Hz,<1.0%,metrics/kernel.csv,instrumented
+process_memory,kernel,/proc process status,RSS/PSS/virtual bytes,1 Hz,<0.1%,metrics/kernel.csv,primary
+allocator_memory,application,jemalloc mallctl,allocated/active/resident bytes,1 Hz,<0.2%,metrics/application.jsonl,primary
+system_memory,kernel,/proc/meminfo,available/dirty/writeback bytes,1 Hz,<0.1%,metrics/kernel.csv,primary
+page_faults,kernel,perf stat,major/minor count,per run,<0.5%,metrics/kernel.csv,primary
+mmap_fault_latency,kernel,eBPF tracepoints,nanoseconds,sampled 99 Hz,<1.0%,metrics/kernel.csv,instrumented
+scheduler,kernel,perf sched/context-switch trace,count and nanoseconds,sampled 99 Hz,<1.0%,metrics/kernel.csv,instrumented
+futex_offcpu,kernel,eBPF off-CPU stacks,nanoseconds,sampled 99 Hz,<1.0%,metrics/kernel.csv,instrumented
+syscall_latency,kernel,eBPF syscall histograms,count and nanoseconds,per-CPU histogram 1s,<1.0%,metrics/kernel.csv,instrumented
+block_io,kernel,eBPF block trace,queue depth bytes and nanoseconds,per-CPU histogram 1s,<1.0%,metrics/kernel.csv,instrumented
+writeback,kernel,/proc/vmstat plus tracepoints,pages and nanoseconds,1 Hz,<0.2%,metrics/kernel.csv,primary
+numa,kernel,perf stat plus /proc/vmstat,count,per run,<0.5%,metrics/kernel.csv,primary
+irq,kernel,/proc/interrupts,count,run boundaries,negligible,metrics/kernel.csv,primary
+cpu_frequency,kernel,cpufreq and turbostat,MHz,1 Hz,<0.5%,metrics/kernel.csv,primary
+fpga_kernel_latency,fpga,FPGA runtime timestamps,nanoseconds,every batch,<0.2%,metrics/fpga.jsonl,candidate
+pcie_dma,fpga,FPGA runtime counters,bytes and nanoseconds,every batch aggregated 1s,<0.3%,metrics/fpga.jsonl,candidate
+fpga_queue,fpga,host runtime counters,depth and nanoseconds,every batch aggregated 1s,<0.3%,metrics/fpga.jsonl,candidate
+fpga_serialization,fpga,host runtime span,bytes and nanoseconds,every batch aggregated 1s,<0.3%,metrics/fpga.jsonl,candidate
+fpga_synchronization,fpga,host runtime span,nanoseconds,every batch aggregated 1s,<0.3%,metrics/fpga.jsonl,candidate
+fpga_cpu_orchestration,fpga,host runtime span,cpu nanoseconds,every batch aggregated 1s,<0.3%,metrics/fpga.jsonl,candidate
+fpga_fallback,fpga,host runtime counter,count reason and nanoseconds,every event,<0.1%,metrics/fpga.jsonl,candidate
+fpga_batchability_projection,fpga,derived DB/Trie dependency trace,independent operations/batch and interarrival nanoseconds,every instrumented run,negligible,summary.json,instrumented
+fpga_projected_transfer,fpga,derived DB/Trie size trace,bytes/op and bytes/batch,every instrumented run,negligible,summary.json,instrumented
