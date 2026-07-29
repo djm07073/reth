@@ -1,0 +1,4 @@
+inputs/corpus.jsonl
+inputs/reth-mainnet-through-20999999.tar.zst
+inputs/snapshot-inventory.json
+cpu-baseline/
