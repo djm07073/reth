@@ -6,8 +6,6 @@ use rustc_hash::FxHashMap;
 use std::{array, sync::Arc, time::Duration};
 use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
-const LARGE_VALUE_THRESHOLD_BYTES: usize = 4096;
-
 /// Caches metric handles for database environment to make sure handles are not re-created
 /// on every operation.
 ///
@@ -133,9 +131,7 @@ impl DatabaseEnvMetrics {
         &self,
         mode: TransactionMode,
         outcome: TransactionOutcome,
-        open_duration: Duration,
-        close_duration: Option<Duration>,
-        commit_latency: Option<reth_libmdbx::CommitLatency>,
+        close: TransactionCloseMetrics,
     ) {
         self.transactions
             .get(&mode)
@@ -145,8 +141,24 @@ impl DatabaseEnvMetrics {
         self.transaction_outcomes
             .get(&(mode, outcome))
             .expect("transaction outcome metric handle not found")
-            .record(open_duration, close_duration, commit_latency);
+            .record(
+                close.open_duration,
+                close.close_duration,
+                close.commit_latency,
+                close.transaction_space,
+                close.page_ops,
+            );
     }
+}
+
+/// Measurements captured while closing one database transaction.
+#[cfg(feature = "mdbx")]
+pub(crate) struct TransactionCloseMetrics {
+    pub(crate) open_duration: Duration,
+    pub(crate) close_duration: Option<Duration>,
+    pub(crate) commit_latency: Option<reth_libmdbx::CommitLatency>,
+    pub(crate) transaction_space: Option<(u64, u64)>,
+    pub(crate) page_ops: Option<[u64; 12]>,
 }
 
 /// Transaction mode for the database, either read-only or read-write.
@@ -223,6 +235,12 @@ pub(crate) enum Operation {
     CursorDeleteCurrent,
     /// Database cursor delete current duplicates operation.
     CursorDeleteCurrentDuplicates,
+    /// Database cursor exact seek operation.
+    CursorSeekExact,
+    /// Database cursor range seek operation.
+    CursorSeek,
+    /// Database duplicate cursor seek by key and subkey operation.
+    CursorSeekByKeySubkey,
 }
 
 impl Operation {
@@ -239,6 +257,9 @@ impl Operation {
             Self::CursorAppendDup => 7,
             Self::CursorDeleteCurrent => 8,
             Self::CursorDeleteCurrentDuplicates => 9,
+            Self::CursorSeekExact => 10,
+            Self::CursorSeek => 11,
+            Self::CursorSeekByKeySubkey => 12,
         }
     }
 
@@ -255,6 +276,9 @@ impl Operation {
             7 => Self::CursorAppendDup,
             8 => Self::CursorDeleteCurrent,
             9 => Self::CursorDeleteCurrentDuplicates,
+            10 => Self::CursorSeekExact,
+            11 => Self::CursorSeek,
+            12 => Self::CursorSeekByKeySubkey,
             _ => panic!("invalid operation index"),
         }
     }
@@ -272,6 +296,9 @@ impl Operation {
             Self::CursorAppendDup => "cursor-append-dup",
             Self::CursorDeleteCurrent => "cursor-delete-current",
             Self::CursorDeleteCurrentDuplicates => "cursor-delete-current-duplicates",
+            Self::CursorSeekExact => "cursor-seek-exact",
+            Self::CursorSeek => "cursor-seek",
+            Self::CursorSeekByKeySubkey => "cursor-seek-by-key-subkey",
         }
     }
 }
@@ -343,6 +370,34 @@ pub(crate) struct TransactionOutcomeMetrics {
     commit_whole_duration_seconds: Histogram,
     /// User-mode CPU time spent on GC update during transaction commit
     commit_gc_cputime_duration_seconds: Histogram,
+    /// Dirty bytes accumulated by a write transaction immediately before commit
+    dirty_bytes: Histogram,
+    /// Bytes retired by copy-on-write in a write transaction immediately before commit
+    retired_bytes: Histogram,
+    /// New MDBX pages allocated during the transaction
+    page_newly_total: Counter,
+    /// MDBX pages copied on write during the transaction
+    page_cow_total: Counter,
+    /// Parent dirty pages cloned during the transaction
+    page_clone_total: Counter,
+    /// MDBX page splits during the transaction
+    page_split_total: Counter,
+    /// MDBX page merges during the transaction
+    page_merge_total: Counter,
+    /// MDBX dirty pages spilled during the transaction
+    page_spill_total: Counter,
+    /// MDBX pages reloaded after spill during the transaction
+    page_unspill_total: Counter,
+    /// MDBX explicit disk write operations during the transaction
+    page_wops_total: Counter,
+    /// MDBX explicit msync operations during the transaction
+    page_msync_total: Counter,
+    /// MDBX explicit fsync operations during the transaction
+    page_fsync_total: Counter,
+    /// MDBX prefault write operations during the transaction
+    page_prefault_total: Counter,
+    /// MDBX mincore calls during the transaction
+    page_mincore_total: Counter,
 }
 
 impl TransactionOutcomeMetrics {
@@ -354,6 +409,8 @@ impl TransactionOutcomeMetrics {
         open_duration: Duration,
         close_duration: Option<Duration>,
         commit_latency: Option<reth_libmdbx::CommitLatency>,
+        transaction_space: Option<(u64, u64)>,
+        page_ops: Option<[u64; 12]>,
     ) {
         self.open_duration_seconds.record(open_duration);
 
@@ -371,6 +428,29 @@ impl TransactionOutcomeMetrics {
             self.commit_whole_duration_seconds.record(commit_latency.whole());
             self.commit_gc_cputime_duration_seconds.record(commit_latency.gc_cputime());
         }
+
+        if let Some((dirty_bytes, retired_bytes)) = transaction_space {
+            self.dirty_bytes.record(dirty_bytes as f64);
+            self.retired_bytes.record(retired_bytes as f64);
+        }
+
+        if let Some(
+            [newly, cow, clone, split, merge, spill, unspill, wops, msync, fsync, prefault, mincore],
+        ) = page_ops
+        {
+            self.page_newly_total.increment(newly);
+            self.page_cow_total.increment(cow);
+            self.page_clone_total.increment(clone);
+            self.page_split_total.increment(split);
+            self.page_merge_total.increment(merge);
+            self.page_spill_total.increment(spill);
+            self.page_unspill_total.increment(unspill);
+            self.page_wops_total.increment(wops);
+            self.page_msync_total.increment(msync);
+            self.page_fsync_total.increment(fsync);
+            self.page_prefault_total.increment(prefault);
+            self.page_mincore_total.increment(mincore);
+        }
     }
 }
 
@@ -379,28 +459,40 @@ impl TransactionOutcomeMetrics {
 pub(crate) struct OperationMetrics {
     /// Total number of database operations made
     calls_total: Counter,
-    /// The time it took to execute a database operation (`put/upsert/insert/append/append_dup`)
-    /// with value larger than [`LARGE_VALUE_THRESHOLD_BYTES`] bytes.
-    large_value_duration_seconds: Histogram,
+    /// Wall-clock duration of every profiled database operation.
+    duration_seconds: Histogram,
+    /// Encoded input bytes supplied to the operation. For delete-current this is the last observed
+    /// matched value size.
+    logical_bytes_total: Counter,
+    /// Encoded bytes returned by seek operations.
+    result_bytes_total: Counter,
+    /// Wall-clock duration of value serialization before a database write.
+    serialization_duration_seconds: Histogram,
+    /// Encoded bytes produced by serialization before a database write.
+    serialized_bytes_total: Counter,
 }
 
 impl OperationMetrics {
     /// Record operation metric.
-    ///
-    /// The duration it took to execute the closure is recorded only if the provided `value_size` is
-    /// larger than [`LARGE_VALUE_THRESHOLD_BYTES`].
     pub(crate) fn record<R>(&self, value_size: Option<usize>, f: impl FnOnce() -> R) -> R {
         self.calls_total.increment(1);
-
-        // Record duration only for large values to prevent the performance hit of clock syscall
-        // on small operations
-        if value_size.is_some_and(|size| size > LARGE_VALUE_THRESHOLD_BYTES) {
-            let start = Instant::now();
-            let result = f();
-            self.large_value_duration_seconds.record(start.elapsed());
-            result
-        } else {
-            f()
+        if let Some(value_size) = value_size {
+            self.logical_bytes_total.increment(value_size as u64);
         }
+        let start = Instant::now();
+        let result = f();
+        self.duration_seconds.record(start.elapsed());
+        result
+    }
+
+    /// Record encoded result bytes from a completed operation.
+    pub(crate) fn record_result_bytes(&self, result_size: usize) {
+        self.result_bytes_total.increment(result_size as u64);
+    }
+
+    /// Record serialization work performed before a database write.
+    pub(crate) fn record_serialization(&self, duration: Duration, serialized_size: usize) {
+        self.serialization_duration_seconds.record(duration);
+        self.serialized_bytes_total.increment(serialized_size as u64);
     }
 }
