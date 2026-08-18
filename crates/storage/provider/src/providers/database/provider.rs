@@ -682,9 +682,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             for (i, block) in blocks.iter().enumerate() {
                 let recovered_block = block.recovered_block();
 
+                let page_ops = self.tx.page_ops();
                 let start = Instant::now();
                 self.insert_block_mdbx_only(recovered_block, tx_nums[i])?;
                 timings.insert_block += start.elapsed();
+                self.metrics.record_page_ops("insert-block", page_ops, self.tx.page_ops());
 
                 if save_mode.with_state() {
                     let execution_output = block.execution_outcome();
@@ -692,6 +694,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     // Write state and changesets to the database.
                     // Must be written after blocks because of the receipt lookup.
                     // Skip receipts/account changesets if they're being written to static files.
+                    let page_ops = self.tx.page_ops();
                     let start = Instant::now();
                     self.write_state(
                         WriteStateInput::Single {
@@ -706,6 +709,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                         },
                     )?;
                     timings.write_state += start.elapsed();
+                    self.metrics.record_page_ops("write-state", page_ops, self.tx.page_ops());
                 }
             }
 
@@ -713,6 +717,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             // This reduces cursor open/close overhead from N calls to 1.
             if save_mode.with_state() {
                 // Blocks are oldest-to-newest, merge_batch expects newest-to-oldest.
+                let page_ops = self.tx.page_ops();
                 let start = Instant::now();
                 let merged_hashed_state = HashedPostStateSorted::merge_batch(
                     blocks.iter().rev().map(|b| b.trie_data().hashed_state),
@@ -721,6 +726,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     self.write_hashed_state(&merged_hashed_state)?;
                 }
                 timings.write_hashed_state += start.elapsed();
+                self.metrics.record_page_ops("write-hashed-state", page_ops, self.tx.page_ops());
 
                 let start = Instant::now();
                 let merged_trie =
@@ -3146,16 +3152,20 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         }
 
         let mut num_entries = 0;
+        let account_page_ops = self.tx.page_ops();
         let account_start = Instant::now();
         reth_trie_db::with_adapter!(self, |A| {
             Self::write_account_trie_updates::<A>(self.tx_ref(), trie_updates, &mut num_entries)?;
         });
         let account_duration = account_start.elapsed();
+        self.metrics.record_page_ops("write-account-trie", account_page_ops, self.tx.page_ops());
 
+        let storage_page_ops = self.tx.page_ops();
         let storage_start = Instant::now();
         num_entries +=
             self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref().iter())?;
         let storage_duration = storage_start.elapsed();
+        self.metrics.record_page_ops("write-storage-trie", storage_page_ops, self.tx.page_ops());
 
         Ok((num_entries, account_duration, storage_duration))
     }

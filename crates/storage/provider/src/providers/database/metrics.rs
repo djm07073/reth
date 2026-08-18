@@ -1,4 +1,5 @@
 use metrics::{Gauge, Histogram};
+use reth_db_api::transaction::DatabasePageOps;
 use reth_metrics::Metrics;
 use reth_primitives_traits::FastInstant as Instant;
 use std::time::Duration;
@@ -167,6 +168,33 @@ pub(crate) struct CommitTimings {
 }
 
 impl DatabaseProviderMetrics {
+    /// Records page work attributed to one bounded persistence phase.
+    pub(crate) fn record_page_ops(
+        &self,
+        phase: &'static str,
+        before: Option<DatabasePageOps>,
+        after: Option<DatabasePageOps>,
+    ) {
+        let Some((before, after)) = before.zip(after) else { return };
+        let delta = after.saturating_sub(before);
+        for (operation, value) in [
+            ("newly", delta.newly),
+            ("cow", delta.cow),
+            ("clone", delta.clone),
+            ("split", delta.split),
+            ("merge", delta.merge),
+            ("spill", delta.spill),
+            ("unspill", delta.unspill),
+        ] {
+            metrics::counter!(
+                "storage.providers.database.page_ops_total",
+                "phase" => phase,
+                "operation" => operation
+            )
+            .increment(value);
+        }
+    }
+
     /// Records the duration for the given action.
     pub(crate) fn record_duration(&self, action: Action, duration: Duration) {
         match action {

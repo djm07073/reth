@@ -7,7 +7,7 @@ use crate::{
 };
 use reth_db_api::{
     table::{Compress, DupSort, Encode, IntoVec, Table, TableImporter},
-    transaction::{DbTx, DbTxMut},
+    transaction::{DatabasePageOps, DbTx, DbTxMut},
 };
 use reth_libmdbx::{
     ffi::{self, MDBX_dbi},
@@ -428,6 +428,19 @@ impl<K: TransactionKind> DbTx for Tx<K> {
         }
 
         self.inner.disable_timeout();
+    }
+
+    fn page_ops(&self) -> Option<DatabasePageOps> {
+        let page_ops = self.inner.env().info().ok()?.page_ops();
+        Some(DatabasePageOps {
+            newly: page_ops.newly,
+            cow: page_ops.cow,
+            clone: page_ops.clone,
+            split: page_ops.split,
+            merge: page_ops.merge,
+            spill: page_ops.spill,
+            unspill: page_ops.unspill,
+        })
     }
 }
 

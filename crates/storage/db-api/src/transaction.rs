@@ -5,6 +5,43 @@ use crate::{
 };
 use std::fmt::Debug;
 
+/// Cumulative MDBX-style page-operation counters exposed by a database transaction.
+///
+/// Backends that do not use page-based copy-on-write storage return `None` from
+/// [`DbTx::page_ops`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatabasePageOps {
+    /// Pages allocated for new tree content.
+    pub newly: u64,
+    /// Frozen pages copied for modification.
+    pub cow: u64,
+    /// Parent-transaction dirty pages cloned by a nested transaction.
+    pub clone: u64,
+    /// Page splits.
+    pub split: u64,
+    /// Page merges.
+    pub merge: u64,
+    /// Dirty pages spilled before commit.
+    pub spill: u64,
+    /// Previously spilled pages restored for modification.
+    pub unspill: u64,
+}
+
+impl DatabasePageOps {
+    /// Returns a monotonic-counter delta without underflowing if an environment is reopened.
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            newly: self.newly.saturating_sub(earlier.newly),
+            cow: self.cow.saturating_sub(earlier.cow),
+            clone: self.clone.saturating_sub(earlier.clone),
+            split: self.split.saturating_sub(earlier.split),
+            merge: self.merge.saturating_sub(earlier.merge),
+            spill: self.spill.saturating_sub(earlier.spill),
+            unspill: self.unspill.saturating_sub(earlier.unspill),
+        }
+    }
+}
+
 /// Helper adapter type for accessing [`DbTx`] cursor.
 pub type CursorTy<TX, T> = <TX as DbTx>::Cursor<T>;
 
@@ -46,6 +83,11 @@ pub trait DbTx: Debug + Send {
     fn entries<T: Table>(&self) -> Result<usize, DatabaseError>;
     /// Disables long-lived read transaction safety guarantees.
     fn disable_long_read_transaction_safety(&mut self);
+
+    /// Returns cumulative page-operation counters when supported by the backend.
+    fn page_ops(&self) -> Option<DatabasePageOps> {
+        None
+    }
 }
 
 /// Read write transaction that allows writing to database
@@ -76,4 +118,44 @@ pub trait DbTxMut: Send {
     fn cursor_write<T: Table>(&self) -> Result<Self::CursorMut<T>, DatabaseError>;
     /// `DupCursor` mut.
     fn cursor_dup_write<T: DupSort>(&self) -> Result<Self::DupCursorMut<T>, DatabaseError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabasePageOps;
+
+    #[test]
+    fn page_ops_delta_saturates_reopened_environment_counters() {
+        let before = DatabasePageOps {
+            newly: 10,
+            cow: 20,
+            clone: 3,
+            split: 4,
+            merge: 5,
+            spill: 6,
+            unspill: 7,
+        };
+        let after = DatabasePageOps {
+            newly: 15,
+            cow: 18,
+            clone: 5,
+            split: 8,
+            merge: 5,
+            spill: 7,
+            unspill: 9,
+        };
+
+        assert_eq!(
+            after.saturating_sub(before),
+            DatabasePageOps {
+                newly: 5,
+                cow: 0,
+                clone: 2,
+                split: 4,
+                merge: 0,
+                spill: 1,
+                unspill: 2,
+            }
+        );
+    }
 }

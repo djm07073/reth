@@ -151,6 +151,30 @@ def main() -> int:
             )
         )
 
+    page_ops_by_phase: dict[str, dict[str, int]] = {}
+    for (name, labels), value in after.items():
+        if name != "reth_storage_providers_database_page_ops_total":
+            continue
+        label_map = dict(labels)
+        phase = label_map.get("phase", "")
+        operation = label_map.get("operation", "")
+        if not phase or not operation or value <= before.get((name, labels), 0):
+            continue
+        page_ops_by_phase.setdefault(phase, {})[operation] = int(
+            round(
+                delta(
+                    before,
+                    after,
+                    "reth_storage_providers_database_page_ops_total",
+                    {"phase": phase, "operation": operation},
+                )
+            )
+        )
+    page_ops_by_phase = {
+        phase: dict(sorted(operations.items()))
+        for phase, operations in sorted(page_ops_by_phase.items())
+    }
+
     page_batch_tables = sorted(
         {
             dict(labels).get("table", "")
@@ -293,6 +317,7 @@ def main() -> int:
             ),
         },
         "mdbx_page_ops": page_ops,
+        "mdbx_page_ops_by_persistence_phase": page_ops_by_phase,
         "mdbx_page_batches": page_batches,
         "pwrite_evidence": {
             "mdbx_prefault_write_operations": page_ops["prefault"],

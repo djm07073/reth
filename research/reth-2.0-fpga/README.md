@@ -112,6 +112,13 @@ Use `--measured-blocks 500` for the full confirmation. Use
 larger `--persistence-threshold` changes batching; the runner derives the corresponding
 backpressure threshold and drains the final pending batch before validating the cold reopen.
 
+If the immutable corpus ends at the measured endpoint, a larger batch may need future trigger
+blocks that the lock correctly refuses to serve. Do not extend the corpus implicitly. Preserve the
+injection-end boundary and use `recover_locked_corpus_tail.py` to replay only the pending measured
+tail with an exact temporary threshold, followed by a cold reopen with the original threshold. The
+recovery manifest is durability evidence; it does not manufacture a native original-threshold
+drain-latency sample.
+
 ## Reduce profiles and metrics
 
 ```console
@@ -155,3 +162,6 @@ next final-page-builder design are documented in
 [`docs/design/cpu-page-batch-reference-engine.md`](../../docs/design/cpu-page-batch-reference-engine.md)
 and
 [`docs/design/cpu-page-batch-benchmark-report.md`](../../docs/design/cpu-page-batch-benchmark-report.md).
+The accepted software COW candidate, fair batch-17/batch-33 comparison, and full 500-block
+confirmation are documented in
+[`docs/design/cow-transaction-batching-benchmark-report.md`](../../docs/design/cow-transaction-batching-benchmark-report.md).
