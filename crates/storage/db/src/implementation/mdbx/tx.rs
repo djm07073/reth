@@ -2,20 +2,26 @@
 
 use super::{cursor::Cursor, utils::*};
 use crate::{
-    metrics::{DatabaseEnvMetrics, Operation, TransactionMode, TransactionOutcome},
+    metrics::{
+        DatabaseEnvMetrics, Operation, TransactionCloseMetrics, TransactionMode, TransactionOutcome,
+    },
     DatabaseError,
 };
 use reth_db_api::{
     table::{Compress, DupSort, Encode, IntoVec, Table, TableImporter},
     transaction::{DbTx, DbTxMut},
 };
-use reth_libmdbx::{ffi::MDBX_dbi, CommitLatency, Transaction, TransactionKind, WriteFlags, RW};
+use reth_libmdbx::{
+    ffi::{self, MDBX_dbi},
+    CommitLatency, Transaction, TransactionKind, WriteFlags, RW,
+};
 use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
 use reth_tracing::tracing::{debug, instrument, trace, warn};
 use std::{
     backtrace::Backtrace,
     collections::HashMap,
     marker::PhantomData,
+    mem::MaybeUninit,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -25,6 +31,28 @@ use std::{
 
 /// Duration after which we emit the log about long-lived database transactions.
 const LONG_TRANSACTION_DURATION: Duration = Duration::from_secs(60);
+
+/// Captures cumulative environment page-operation counters at a transaction boundary.
+fn page_ops_snapshot<K: TransactionKind>(transaction: &Transaction<K>) -> Option<[u64; 12]> {
+    if K::IS_READ_ONLY {
+        return None
+    }
+    let page_ops = transaction.env().info().ok()?.page_ops();
+    Some([
+        page_ops.newly,
+        page_ops.cow,
+        page_ops.clone,
+        page_ops.split,
+        page_ops.merge,
+        page_ops.spill,
+        page_ops.unspill,
+        page_ops.wops,
+        page_ops.msync,
+        page_ops.fsync,
+        page_ops.prefault,
+        page_ops.mincore,
+    ])
+}
 
 /// Wrapper for the libmdbx transaction.
 #[derive(Debug)]
@@ -53,7 +81,8 @@ impl<K: TransactionKind> Tx<K> {
     ) -> reth_libmdbx::Result<Self> {
         let metrics_handler = env_metrics
             .map(|env_metrics| {
-                let handler = MetricsHandler::<K>::new(inner.id()?, env_metrics);
+                let handler =
+                    MetricsHandler::<K>::new(inner.id()?, env_metrics, page_ops_snapshot(&inner));
                 handler.env_metrics.record_opened_transaction(handler.transaction_mode());
                 handler.log_transaction_opened();
                 Ok(handler)
@@ -113,6 +142,8 @@ impl<K: TransactionKind> Tx<K> {
         outcome: TransactionOutcome,
         f: impl FnOnce(Self) -> (R, Option<CommitLatency>),
     ) -> R {
+        let transaction_space = self.transaction_space_metrics();
+        let page_ops_env = (!K::IS_READ_ONLY).then(|| self.inner.env().clone());
         let run = |tx| {
             let start = Instant::now();
             let (result, commit_latency) = f(tx);
@@ -137,18 +168,65 @@ impl<K: TransactionKind> Tx<K> {
 
             let (result, commit_latency, close_duration) = run(self);
             let open_duration = metrics_handler.start.elapsed();
+            let page_ops = page_ops_env
+                .as_ref()
+                .and_then(|env| env.info().ok())
+                .map(|info| info.page_ops())
+                .zip(metrics_handler.page_ops_at_open)
+                .map(|(after, before)| {
+                    let after = [
+                        after.newly,
+                        after.cow,
+                        after.clone,
+                        after.split,
+                        after.merge,
+                        after.spill,
+                        after.unspill,
+                        after.wops,
+                        after.msync,
+                        after.fsync,
+                        after.prefault,
+                        after.mincore,
+                    ];
+                    std::array::from_fn(|index| after[index].saturating_sub(before[index]))
+                });
             metrics_handler.env_metrics.record_closed_transaction(
                 metrics_handler.transaction_mode(),
                 outcome,
-                open_duration,
-                Some(close_duration),
-                commit_latency,
+                TransactionCloseMetrics {
+                    open_duration,
+                    close_duration: Some(close_duration),
+                    commit_latency,
+                    transaction_space,
+                    page_ops,
+                },
             );
 
             result
         } else {
             run(self).0
         }
+    }
+
+    /// Returns dirty and copy-on-write-retired bytes immediately before a write transaction is
+    /// closed. This uses libMDBX's public `mdbx_txn_info` API and does not scan the reader table.
+    fn transaction_space_metrics(&self) -> Option<(u64, u64)> {
+        if K::IS_READ_ONLY {
+            return None
+        }
+
+        self.inner
+            .txn_execute(|txn| unsafe {
+                let mut info = MaybeUninit::<ffi::MDBX_txn_info>::zeroed();
+                (ffi::mdbx_txn_info(txn, info.as_mut_ptr(), false) == ffi::MDBX_SUCCESS).then(
+                    || {
+                        let info = info.assume_init();
+                        (info.txn_space_dirty, info.txn_space_retired)
+                    },
+                )
+            })
+            .ok()
+            .flatten()
     }
 
     /// If `self.metrics_handler == Some(_)`, measure the time it takes to execute the closure and
@@ -191,6 +269,8 @@ struct MetricsHandler<K: TransactionKind> {
     backtrace_recorded: AtomicBool,
     /// Shared database environment metrics.
     env_metrics: Arc<DatabaseEnvMetrics>,
+    /// Cumulative MDBX page-operation counters observed when this transaction opened.
+    page_ops_at_open: Option<[u64; 12]>,
     /// Backtrace of the location where the transaction has been opened. Reported only with debug
     /// assertions, because capturing the backtrace on every transaction opening is expensive.
     #[cfg(debug_assertions)]
@@ -199,7 +279,11 @@ struct MetricsHandler<K: TransactionKind> {
 }
 
 impl<K: TransactionKind> MetricsHandler<K> {
-    fn new(txn_id: u64, env_metrics: Arc<DatabaseEnvMetrics>) -> Self {
+    fn new(
+        txn_id: u64,
+        env_metrics: Arc<DatabaseEnvMetrics>,
+        page_ops_at_open: Option<[u64; 12]>,
+    ) -> Self {
         Self {
             txn_id,
             start: Instant::now(),
@@ -210,6 +294,7 @@ impl<K: TransactionKind> MetricsHandler<K> {
             #[cfg(debug_assertions)]
             open_backtrace: Backtrace::force_capture(),
             env_metrics,
+            page_ops_at_open,
             _marker: PhantomData,
         }
     }
@@ -272,9 +357,13 @@ impl<K: TransactionKind> Drop for MetricsHandler<K> {
             self.env_metrics.record_closed_transaction(
                 self.transaction_mode(),
                 TransactionOutcome::Drop,
-                self.start.elapsed(),
-                None,
-                None,
+                TransactionCloseMetrics {
+                    open_duration: self.start.elapsed(),
+                    close_duration: None,
+                    commit_latency: None,
+                    transaction_space: None,
+                    page_ops: None,
+                },
             );
         }
     }

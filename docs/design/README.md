@@ -4,6 +4,7 @@ Docs under this page contain some context on how we've iterated on the Reth desi
 
 - [Reth Goals](./goals.md)
 - [Database](./database.md)
+- [FPGA-assisted MDBX page mutation](./fpga-mdbx-page-mutation-accelerator.md)
 - Networking
     - [P2P](./p2p.md)
     - [Headers Downloader](./headers-downloader.md)

@@ -15,7 +15,7 @@ use reth_db_api::{
 };
 use reth_libmdbx::{Error as MDBXError, TransactionKind, WriteFlags, RO, RW};
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
-use std::{borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds};
+use std::{borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds, time::Instant};
 
 /// Read only Cursor.
 pub type CursorRO<T> = Cursor<RO, T>;
@@ -31,6 +31,8 @@ pub struct Cursor<K: TransactionKind, T: Table> {
     buf: Vec<u8>,
     /// Per-table operation metrics. If `None`, metrics are not recorded.
     metrics: Option<TableOperationMetrics>,
+    /// Encoded value size observed by the most recent instrumented seek.
+    last_read_value_size: Option<usize>,
     /// Phantom data to enforce encoding/decoding.
     _dbi: PhantomData<T>,
 }
@@ -40,7 +42,7 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
         inner: reth_libmdbx::Cursor<K>,
         metrics: Option<TableOperationMetrics>,
     ) -> Self {
-        Self { inner, buf: Vec::new(), metrics, _dbi: PhantomData }
+        Self { inner, buf: Vec::new(), metrics, last_read_value_size: None, _dbi: PhantomData }
     }
 
     /// If `self.metrics` is `Some(...)`, record a metric with the provided operation and value
@@ -57,6 +59,25 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
             metrics[operation.index()].record(value_size, || f(self))
         } else {
             f(self)
+        }
+    }
+
+    /// Records encoded bytes returned by an operation.
+    fn record_operation_result_bytes(&self, operation: Operation, result_size: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics[operation.index()].record_result_bytes(result_size);
+        }
+    }
+
+    /// Records serialization work performed before a write operation.
+    fn record_serialization(
+        &self,
+        operation: Operation,
+        duration: std::time::Duration,
+        serialized_size: usize,
+    ) {
+        if let Some(metrics) = &self.metrics {
+            metrics[operation.index()].record_serialization(duration, serialized_size);
         }
     }
 }
@@ -94,11 +115,43 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
     }
 
     fn seek_exact(&mut self, key: <T as Table>::Key) -> PairResult<T> {
-        decode::<T>(self.inner.set_key(key.encode().as_ref()))
+        let key = key.encode();
+        let result = self.execute_with_operation_metric(
+            Operation::CursorSeekExact,
+            Some(key.as_ref().len()),
+            |this| this.inner.set_key::<Cow<'_, [u8]>, Cow<'_, [u8]>>(key.as_ref()),
+        );
+        let result_size = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|(result_key, value)| result_key.len() + value.len());
+        self.last_read_value_size =
+            result.as_ref().ok().and_then(Option::as_ref).map(|(_, value)| value.len());
+        if let Some(result_size) = result_size {
+            self.record_operation_result_bytes(Operation::CursorSeekExact, result_size);
+        }
+        decode::<T>(result)
     }
 
     fn seek(&mut self, key: <T as Table>::Key) -> PairResult<T> {
-        decode::<T>(self.inner.set_range(key.encode().as_ref()))
+        let key = key.encode();
+        let result = self.execute_with_operation_metric(
+            Operation::CursorSeek,
+            Some(key.as_ref().len()),
+            |this| this.inner.set_range::<Cow<'_, [u8]>, Cow<'_, [u8]>>(key.as_ref()),
+        );
+        let result_size = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|(result_key, value)| result_key.len() + value.len());
+        self.last_read_value_size =
+            result.as_ref().ok().and_then(Option::as_ref).map(|(_, value)| value.len());
+        if let Some(result_size) = result_size {
+            self.record_operation_result_bytes(Operation::CursorSeek, result_size);
+        }
+        decode::<T>(result)
     }
 
     fn next(&mut self) -> PairResult<T> {
@@ -196,11 +249,19 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
         key: <T as Table>::Key,
         subkey: <T as DupSort>::SubKey,
     ) -> ValueOnlyResult<T> {
-        self.inner
-            .get_both_range(key.encode().as_ref(), subkey.encode().as_ref())
-            .map_err(|e| DatabaseError::Read(e.into()))?
-            .map(decode_one::<T>)
-            .transpose()
+        let key = key.encode();
+        let subkey = subkey.encode();
+        let result = self.execute_with_operation_metric(
+            Operation::CursorSeekByKeySubkey,
+            Some(key.as_ref().len() + subkey.as_ref().len()),
+            |this| this.inner.get_both_range::<Cow<'_, [u8]>>(key.as_ref(), subkey.as_ref()),
+        );
+        let result_size = result.as_ref().ok().and_then(Option::as_ref).map(|value| value.len());
+        self.last_read_value_size = result_size;
+        if let Some(result_size) = result_size {
+            self.record_operation_result_bytes(Operation::CursorSeekByKeySubkey, result_size);
+        }
+        result.map_err(|e| DatabaseError::Read(e.into()))?.map(decode_one::<T>).transpose()
     }
 
     /// Depending on its arguments, returns an iterator starting at:
@@ -256,10 +317,17 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     /// found, before calling `upsert`.
     fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorUpsert,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorUpsert,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::UPSERT)
@@ -278,10 +346,17 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
 
     fn insert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorInsert,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorInsert,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::NO_OVERWRITE)
@@ -302,10 +377,17 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     /// will fail if the inserted key is less than the last table key
     fn append(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorAppend,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorAppend,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::APPEND)
@@ -323,25 +405,38 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     }
 
     fn delete_current(&mut self) -> Result<(), DatabaseError> {
-        self.execute_with_operation_metric(Operation::CursorDeleteCurrent, None, |this| {
-            this.inner.del(WriteFlags::CURRENT).map_err(|e| DatabaseError::Delete(e.into()))
-        })
+        self.execute_with_operation_metric(
+            Operation::CursorDeleteCurrent,
+            self.last_read_value_size,
+            |this| this.inner.del(WriteFlags::CURRENT).map_err(|e| DatabaseError::Delete(e.into())),
+        )
     }
 }
 
 impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
-        self.execute_with_operation_metric(Operation::CursorDeleteCurrentDuplicates, None, |this| {
-            this.inner.del(WriteFlags::NO_DUP_DATA).map_err(|e| DatabaseError::Delete(e.into()))
-        })
+        self.execute_with_operation_metric(
+            Operation::CursorDeleteCurrentDuplicates,
+            self.last_read_value_size,
+            |this| {
+                this.inner.del(WriteFlags::NO_DUP_DATA).map_err(|e| DatabaseError::Delete(e.into()))
+            },
+        )
     }
 
     fn append_dup(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorAppendDup,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorAppendDup,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::APPEND_DUP)
