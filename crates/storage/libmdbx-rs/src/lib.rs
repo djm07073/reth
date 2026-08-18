@@ -13,7 +13,9 @@ pub extern crate reth_mdbx_sys as ffi;
 
 pub use crate::{
     codec::*,
-    cursor::{Cursor, Iter, IterDup},
+    cursor::{
+        BatchFallbackReason, BatchMutation, BatchOutcome, BatchResult, Cursor, Iter, IterDup,
+    },
     database::Database,
     environment::{
         Environment, EnvironmentBuilder, EnvironmentKind, Geometry, HandleSlowReadersCallback,

@@ -6,8 +6,8 @@
 use crate::{
     common::{IterPairResult, PairResult, ValueOnlyResult},
     cursor::{
-        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupWalker, RangeWalker,
-        ReverseWalker, Walker,
+        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchFallbackReason,
+        DupBatchOutcome, DupBatchReplacement, DupWalker, RangeWalker, ReverseWalker, Walker,
     },
     database::Database,
     database_metrics::DatabaseMetrics,
@@ -364,6 +364,14 @@ impl<T: Table> DbCursorRW<T> for CursorMock {
         Ok(())
     }
 
+    fn update_current(
+        &mut self,
+        _key: <T as Table>::Key,
+        _value: &<T as Table>::Value,
+    ) -> Result<(), DatabaseError> {
+        Ok(())
+    }
+
     /// Inserts a key-value pair at the current cursor position.
     /// **Mock behavior**: Always succeeds without modifying any data.
     fn insert(
@@ -392,6 +400,14 @@ impl<T: Table> DbCursorRW<T> for CursorMock {
 }
 
 impl<T: DupSort> DbDupCursorRW<T> for CursorMock {
+    fn replace_duplicates_batch(
+        &mut self,
+        _key: <T>::Key,
+        _replacements: &[DupBatchReplacement<<T>::Value>],
+    ) -> Result<DupBatchOutcome, DatabaseError> {
+        Ok(DupBatchOutcome::Unsupported(DupBatchFallbackReason::UnsupportedOperation))
+    }
+
     /// Deletes all duplicate entries at the current cursor position.
     /// **Mock behavior**: Always succeeds without modifying any data.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {

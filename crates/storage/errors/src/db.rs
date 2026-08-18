@@ -115,6 +115,10 @@ pub enum DatabaseWriteOperation {
     CursorAppend,
     /// Upsert cursor.
     CursorUpsert,
+    /// Update the row at the current cursor position.
+    CursorUpdateCurrent,
+    /// Replace duplicate rows through the page-batch API.
+    CursorBatchReplace,
     /// Insert cursor.
     CursorInsert,
     /// Append duplicate cursor.

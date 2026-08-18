@@ -375,6 +375,32 @@ impl DatabaseMetrics for DatabaseEnv {
             metrics.push(("db.page_size", stat.page_size() as f64, vec![]));
         }
 
+        if let Ok(info) = self.info().map_err(|error| error!(%error, "Failed to read db.info")) {
+            let page_ops = info.page_ops();
+            for (operation, value) in [
+                ("newly", page_ops.newly),
+                ("cow", page_ops.cow),
+                ("clone", page_ops.clone),
+                ("split", page_ops.split),
+                ("merge", page_ops.merge),
+                ("spill", page_ops.spill),
+                ("unspill", page_ops.unspill),
+                ("wops", page_ops.wops),
+                ("msync", page_ops.msync),
+                ("fsync", page_ops.fsync),
+                ("prefault", page_ops.prefault),
+                ("mincore", page_ops.mincore),
+            ] {
+                metrics.push((
+                    "db.page_ops",
+                    value as f64,
+                    vec![Label::new("operation", operation)],
+                ));
+            }
+            metrics.push(("db.map_size", info.map_size() as f64, vec![]));
+            metrics.push(("db.last_pgno", info.last_pgno() as f64, vec![]));
+        }
+
         metrics.push((
             "db.timed_out_not_aborted_transactions",
             self.timed_out_not_aborted_transactions() as f64,

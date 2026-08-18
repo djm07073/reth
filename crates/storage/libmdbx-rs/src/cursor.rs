@@ -13,6 +13,60 @@ use ffi::{
 };
 use std::{borrow::Cow, ffi::c_void, fmt, marker::PhantomData, mem, ptr};
 
+/// One exact duplicate replacement for [`Cursor::mutate_batch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchMutation<'a> {
+    /// Existing encoded duplicate value.
+    pub before: &'a [u8],
+    /// Replacement encoded duplicate value.
+    pub after: &'a [u8],
+}
+
+/// Reason the MDBX batch fast path declined a batch before applying mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchFallbackReason {
+    /// The table is not duplicate-sorted.
+    UnsupportedTable,
+    /// The requested operation is not implemented by this reference path.
+    UnsupportedOperation,
+    /// Replacement value length differs from the existing value length.
+    ValueSize,
+    /// An exact existing duplicate was not found.
+    NotFound,
+    /// Mutations resolve to more than one nested leaf.
+    MultipleLeaves,
+    /// Duplicates are stored in an inline subpage instead of a nested tree.
+    Subpage,
+    /// Input or resulting duplicate order is unsupported.
+    Order,
+    /// A newer libMDBX fork returned an unknown reason.
+    Unknown(u32),
+}
+
+/// Counters returned by the MDBX page-batch reference path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchResult {
+    /// Number of replacements applied.
+    pub mutations_applied: usize,
+    /// Source leaf pages read by the fast path.
+    pub source_pages: usize,
+    /// Destination leaf pages emitted by the fast path.
+    pub destination_pages: usize,
+    /// Logical source page bytes.
+    pub source_bytes: usize,
+    /// Logical destination page bytes.
+    pub destination_bytes: usize,
+}
+
+/// Outcome of attempting an MDBX page-batch mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// The fast path applied all replacements.
+    Applied(BatchResult),
+    /// The fast path made no changes; the caller may use sequential operations.
+    Unsupported(BatchFallbackReason),
+}
+
 /// A cursor for navigating the items within a database.
 pub struct Cursor<K>
 where
@@ -371,7 +425,7 @@ where
     {
         let res: Result<Option<((), ())>> = self.set_range(key);
         if let Err(error) = res {
-            return Iter::Err(Some(error))
+            return Iter::Err(Some(error));
         };
         Iter::new(self, ffi::MDBX_GET_CURRENT, ffi::MDBX_NEXT)
     }
@@ -406,7 +460,7 @@ where
     {
         let res: Result<Option<((), ())>> = self.set_range(key);
         if let Err(error) = res {
-            return IterDup::Err(Some(error))
+            return IterDup::Err(Some(error));
         };
         IterDup::new(self, ffi::MDBX_GET_CURRENT)
     }
@@ -422,7 +476,7 @@ where
             Ok(Some(_)) => (),
             Ok(None) => {
                 let _: Result<Option<((), ())>> = self.last();
-                return Iter::new(self, ffi::MDBX_NEXT, ffi::MDBX_NEXT)
+                return Iter::new(self, ffi::MDBX_NEXT, ffi::MDBX_NEXT);
             }
             Err(error) => return Iter::Err(Some(error)),
         };
@@ -431,6 +485,80 @@ where
 }
 
 impl Cursor<RW> {
+    /// Attempts to replace several exact duplicates for one outer key as one MDBX leaf mutation.
+    ///
+    /// [`BatchOutcome::Unsupported`] is atomic: MDBX validates the complete batch before touching
+    /// database contents, so the caller may safely fall back to ordinary cursor operations.
+    pub fn mutate_batch(
+        &mut self,
+        key: &[u8],
+        mutations: &[BatchMutation<'_>],
+    ) -> Result<BatchOutcome> {
+        let key_val = ffi::MDBX_val {
+            iov_len: key.len(),
+            iov_base: key.as_ptr().cast_mut().cast::<c_void>(),
+        };
+        let raw_mutations = mutations
+            .iter()
+            .map(|mutation| ffi::MDBX_batch_mutation {
+                before: ffi::MDBX_val {
+                    iov_len: mutation.before.len(),
+                    iov_base: mutation.before.as_ptr().cast_mut().cast::<c_void>(),
+                },
+                after: ffi::MDBX_val {
+                    iov_len: mutation.after.len(),
+                    iov_base: mutation.after.as_ptr().cast_mut().cast::<c_void>(),
+                },
+                op: ffi::MDBX_BATCH_REPLACE,
+                reserved: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut raw_result = ffi::MDBX_batch_result {
+            mutations_applied: 0,
+            source_pages: 0,
+            destination_pages: 0,
+            source_bytes: 0,
+            destination_bytes: 0,
+            fallback_reason: ffi::MDBX_BATCH_FALLBACK_NONE,
+            reserved: 0,
+        };
+        let unsupported = mdbx_result(unsafe {
+            self.txn.txn_execute(|_| {
+                ffi::mdbx_cursor_mutate_batch(
+                    self.cursor,
+                    &key_val,
+                    raw_mutations.as_ptr(),
+                    raw_mutations.len(),
+                    &mut raw_result,
+                )
+            })?
+        })?;
+
+        if unsupported {
+            let reason = match raw_result.fallback_reason {
+                ffi::MDBX_BATCH_FALLBACK_UNSUPPORTED_TABLE => BatchFallbackReason::UnsupportedTable,
+                ffi::MDBX_BATCH_FALLBACK_UNSUPPORTED_OPERATION => {
+                    BatchFallbackReason::UnsupportedOperation
+                }
+                ffi::MDBX_BATCH_FALLBACK_VALUE_SIZE => BatchFallbackReason::ValueSize,
+                ffi::MDBX_BATCH_FALLBACK_NOT_FOUND => BatchFallbackReason::NotFound,
+                ffi::MDBX_BATCH_FALLBACK_MULTIPLE_LEAVES => BatchFallbackReason::MultipleLeaves,
+                ffi::MDBX_BATCH_FALLBACK_SUBPAGE => BatchFallbackReason::Subpage,
+                ffi::MDBX_BATCH_FALLBACK_ORDER => BatchFallbackReason::Order,
+                other => BatchFallbackReason::Unknown(other),
+            };
+            return Ok(BatchOutcome::Unsupported(reason));
+        }
+
+        Ok(BatchOutcome::Applied(BatchResult {
+            mutations_applied: raw_result.mutations_applied,
+            source_pages: raw_result.source_pages,
+            destination_pages: raw_result.destination_pages,
+            source_bytes: raw_result.source_bytes,
+            destination_bytes: raw_result.destination_bytes,
+        }))
+    }
+
     /// Puts a key/data pair into the database. The cursor will be positioned at
     /// the new data item, or on failure usually near it.
     pub fn put(&mut self, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {

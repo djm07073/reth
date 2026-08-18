@@ -1,6 +1,8 @@
 use alloy_primitives::B256;
 use reth_db_api::{
-    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+    cursor::{
+        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchOutcome, DupBatchReplacement,
+    },
     table::{DupSort, Key, Table, Value},
     tables::{self, PackedAccountsTrie, PackedStoragesTrie},
     transaction::DbTx,
@@ -287,25 +289,53 @@ where
         }
 
         let mut num_entries = 0;
+        let mut replacements = Vec::new();
+        let mut deletes = Vec::new();
+        let mut upserts = Vec::new();
         for (nibbles, maybe_updated) in updates.storage_nodes.iter().filter(|(n, _)| !n.is_empty())
         {
             num_entries += 1;
             let nibbles = A::StorageSubKey::from(*nibbles);
-            // Delete the old entry if it exists.
-            if self
+            let existing = self
                 .cursor
                 .seek_by_key_subkey(self.hashed_address, nibbles.clone())?
-                .as_ref()
-                .is_some_and(|e| *e.nibbles() == nibbles)
-            {
+                .filter(|entry| *entry.nibbles() == nibbles);
+
+            match (existing, maybe_updated) {
+                (Some(before), Some(node)) => replacements.push(DupBatchReplacement {
+                    before,
+                    after: A::StorageValue::new(nibbles, node.clone()),
+                }),
+                (Some(_), None) => deletes.push(nibbles),
+                (None, Some(node)) => upserts.push(A::StorageValue::new(nibbles, node.clone())),
+                (None, None) => {}
+            }
+        }
+
+        if !replacements.is_empty() &&
+            matches!(
+                self.cursor.replace_duplicates_batch(self.hashed_address, &replacements)?,
+                DupBatchOutcome::Unsupported(_)
+            )
+        {
+            for replacement in &replacements {
+                let subkey = replacement.before.nibbles().clone();
+                let current =
+                    self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
+                if current.as_ref().is_some_and(|entry| *entry.nibbles() == subkey) {
+                    self.cursor.update_current(self.hashed_address, &replacement.after)?;
+                }
+            }
+        }
+
+        for subkey in deletes {
+            let current = self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
+            if current.as_ref().is_some_and(|entry| *entry.nibbles() == subkey) {
                 self.cursor.delete_current()?;
             }
-
-            // There is an updated version of this node, insert new entry.
-            if let Some(node) = maybe_updated {
-                self.cursor
-                    .upsert(self.hashed_address, &A::StorageValue::new(nibbles, node.clone()))?;
-            }
+        }
+        for entry in upserts {
+            self.cursor.upsert(self.hashed_address, &entry)?;
         }
 
         Ok(num_entries)

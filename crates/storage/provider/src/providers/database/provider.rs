@@ -36,7 +36,9 @@ use rayon::slice::ParallelSliceMut;
 use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_api::{
-    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+    cursor::{
+        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchOutcome, DupBatchReplacement,
+    },
     database::{Database, ReaderTxnTracker},
     models::{
         sharded_key, storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress,
@@ -723,8 +725,12 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let start = Instant::now();
                 let merged_trie =
                     TrieUpdatesSorted::merge_batch(blocks.iter().rev().map(|b| b.trie_updates()));
+                timings.merge_trie_updates += start.elapsed();
                 if !merged_trie.is_empty() {
-                    self.write_trie_updates_sorted(&merged_trie)?;
+                    let (_, account_duration, storage_duration) =
+                        self.write_trie_updates_sorted_with_timings(&merged_trie)?;
+                    timings.write_account_trie += account_duration;
+                    timings.write_storage_trie += storage_duration;
                 }
                 timings.write_trie_updates += start.elapsed();
             }
@@ -2671,19 +2677,57 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 hashed_storage_cursor.delete_current_duplicates()?;
             }
 
+            let mut replacements = Vec::new();
+            let mut deletes = Vec::new();
+            let mut upserts = Vec::new();
             for (hashed_slot, value) in storage.storage_slots_ref() {
                 let entry = StorageEntry { key: *hashed_slot, value: *value };
 
-                if let Some(db_entry) =
+                let existing = if let Some(db_entry) =
                     hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)? &&
                     db_entry.key == entry.key
                 {
+                    Some(db_entry)
+                } else {
+                    None
+                };
+
+                match (existing, entry.value.is_zero()) {
+                    (Some(_), true) => deletes.push(entry.key),
+                    (Some(before), false) => {
+                        replacements.push(DupBatchReplacement { before, after: entry })
+                    }
+                    (None, false) => upserts.push(entry),
+                    (None, true) => {}
+                }
+            }
+
+            if !replacements.is_empty() &&
+                matches!(
+                    hashed_storage_cursor
+                        .replace_duplicates_batch(*hashed_address, &replacements)?,
+                    DupBatchOutcome::Unsupported(_)
+                )
+            {
+                for replacement in &replacements {
+                    let current = hashed_storage_cursor
+                        .seek_by_key_subkey(*hashed_address, replacement.before.key)?;
+                    if current.as_ref().is_some_and(|entry| entry.key == replacement.before.key) {
+                        hashed_storage_cursor
+                            .update_current(*hashed_address, &replacement.after)?;
+                    }
+                }
+            }
+
+            for hashed_slot in deletes {
+                let current =
+                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, hashed_slot)?;
+                if current.as_ref().is_some_and(|entry| entry.key == hashed_slot) {
                     hashed_storage_cursor.delete_current()?;
                 }
-
-                if !entry.value.is_zero() {
-                    hashed_storage_cursor.upsert(*hashed_address, &entry)?;
-                }
+            }
+            for entry in upserts {
+                hashed_storage_cursor.upsert(*hashed_address, &entry)?;
             }
         }
 
@@ -3091,6 +3135,30 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         }
         Ok(())
     }
+
+    /// Writes account and storage trie updates and returns their individual wall-clock durations.
+    fn write_trie_updates_sorted_with_timings(
+        &self,
+        trie_updates: &TrieUpdatesSorted,
+    ) -> ProviderResult<(usize, std::time::Duration, std::time::Duration)> {
+        if trie_updates.is_empty() {
+            return Ok((0, Default::default(), Default::default()));
+        }
+
+        let mut num_entries = 0;
+        let account_start = Instant::now();
+        reth_trie_db::with_adapter!(self, |A| {
+            Self::write_account_trie_updates::<A>(self.tx_ref(), trie_updates, &mut num_entries)?;
+        });
+        let account_duration = account_start.elapsed();
+
+        let storage_start = Instant::now();
+        num_entries +=
+            self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref().iter())?;
+        let storage_duration = storage_start.elapsed();
+
+        Ok((num_entries, account_duration, storage_duration))
+    }
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider<TX, N> {
@@ -3099,21 +3167,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
     /// Returns the number of entries modified.
     #[instrument(level = "debug", target = "providers::db", skip_all)]
     fn write_trie_updates_sorted(&self, trie_updates: &TrieUpdatesSorted) -> ProviderResult<usize> {
-        if trie_updates.is_empty() {
-            return Ok(0)
-        }
-
-        // Track the number of inserted entries.
-        let mut num_entries = 0;
-
-        reth_trie_db::with_adapter!(self, |A| {
-            Self::write_account_trie_updates::<A>(self.tx_ref(), trie_updates, &mut num_entries)?;
-        });
-
-        num_entries +=
-            self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref().iter())?;
-
-        Ok(num_entries)
+        self.write_trie_updates_sorted_with_timings(trie_updates).map(|(entries, _, _)| entries)
     }
 }
 

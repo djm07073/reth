@@ -85,6 +85,12 @@ pub(crate) struct DatabaseProviderMetrics {
     save_blocks_write_hashed_state: Histogram,
     /// Duration of `write_trie_updates` in `save_blocks`
     save_blocks_write_trie_updates: Histogram,
+    /// Duration of trie update batch merging in `save_blocks`
+    save_blocks_merge_trie_updates: Histogram,
+    /// Duration of writing account trie updates in `save_blocks`
+    save_blocks_write_account_trie: Histogram,
+    /// Duration of writing storage trie updates in `save_blocks`
+    save_blocks_write_storage_trie: Histogram,
     /// Duration of `update_history_indices` in `save_blocks`
     save_blocks_update_history_indices: Histogram,
     /// Duration of `update_pipeline_stages` in `save_blocks`
@@ -113,6 +119,12 @@ pub(crate) struct DatabaseProviderMetrics {
     save_blocks_write_hashed_state_last: Gauge,
     /// Last duration of `write_trie_updates` in `save_blocks`
     save_blocks_write_trie_updates_last: Gauge,
+    /// Last duration of trie update batch merging in `save_blocks`
+    save_blocks_merge_trie_updates_last: Gauge,
+    /// Last duration of writing account trie updates in `save_blocks`
+    save_blocks_write_account_trie_last: Gauge,
+    /// Last duration of writing storage trie updates in `save_blocks`
+    save_blocks_write_storage_trie_last: Gauge,
     /// Last duration of `update_history_indices` in `save_blocks`
     save_blocks_update_history_indices_last: Gauge,
     /// Last duration of `update_pipeline_stages` in `save_blocks`
@@ -138,6 +150,9 @@ pub(crate) struct SaveBlocksTimings {
     pub write_state: Duration,
     pub write_hashed_state: Duration,
     pub write_trie_updates: Duration,
+    pub merge_trie_updates: Duration,
+    pub write_account_trie: Duration,
+    pub write_storage_trie: Duration,
     pub update_history_indices: Duration,
     pub update_pipeline_stages: Duration,
     pub batch_size: u64,
@@ -180,6 +195,9 @@ impl DatabaseProviderMetrics {
         self.save_blocks_write_state.record(timings.write_state);
         self.save_blocks_write_hashed_state.record(timings.write_hashed_state);
         self.save_blocks_write_trie_updates.record(timings.write_trie_updates);
+        self.save_blocks_merge_trie_updates.record(timings.merge_trie_updates);
+        self.save_blocks_write_account_trie.record(timings.write_account_trie);
+        self.save_blocks_write_storage_trie.record(timings.write_storage_trie);
         self.save_blocks_update_history_indices.record(timings.update_history_indices);
         self.save_blocks_update_pipeline_stages.record(timings.update_pipeline_stages);
         self.save_blocks_batch_size.record(timings.batch_size as f64);
@@ -192,6 +210,9 @@ impl DatabaseProviderMetrics {
         self.save_blocks_write_state_last.set(timings.write_state.as_secs_f64());
         self.save_blocks_write_hashed_state_last.set(timings.write_hashed_state.as_secs_f64());
         self.save_blocks_write_trie_updates_last.set(timings.write_trie_updates.as_secs_f64());
+        self.save_blocks_merge_trie_updates_last.set(timings.merge_trie_updates.as_secs_f64());
+        self.save_blocks_write_account_trie_last.set(timings.write_account_trie.as_secs_f64());
+        self.save_blocks_write_storage_trie_last.set(timings.write_storage_trie.as_secs_f64());
         self.save_blocks_update_history_indices_last
             .set(timings.update_history_indices.as_secs_f64());
         self.save_blocks_update_pipeline_stages_last

@@ -111,6 +111,10 @@ pub trait DbCursorRW<T: Table> {
     /// exists in a table, and insert a new row if the specified value doesn't already exist
     fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError>;
 
+    /// Replaces the row at the current cursor position without a separate delete and insert.
+    /// For duplicate-sorted tables this replaces only the current duplicate.
+    fn update_current(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError>;
+
     /// Database operation that will insert a row at a given key. If the key is already
     /// present, the operation will result in an error.
     fn insert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError>;
@@ -125,8 +129,71 @@ pub trait DbCursorRW<T: Table> {
     fn delete_current(&mut self) -> Result<(), DatabaseError>;
 }
 
-/// Read Write Cursor over `DupSort` table.
+/// One replacement submitted to a duplicate page batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DupBatchReplacement<V> {
+    /// Exact duplicate value currently stored in the table.
+    pub before: V,
+    /// Replacement duplicate value.
+    pub after: V,
+}
+
+/// Reason the storage engine declined a duplicate replacement batch without applying it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DupBatchFallbackReason {
+    /// The table layout is not supported.
+    UnsupportedTable,
+    /// The requested operation is not supported.
+    UnsupportedOperation,
+    /// The replacement changes the encoded value size.
+    ValueSize,
+    /// An exact old duplicate could not be found.
+    NotFound,
+    /// The engine could not group the requested leaves safely.
+    MultipleLeaves,
+    /// The duplicates are stored in an inline subpage.
+    Subpage,
+    /// The input or resulting duplicate order is not supported.
+    Order,
+    /// The engine returned a reason unknown to this Reth version.
+    Unknown(u32),
+}
+
+/// Page-level work reported by an applied duplicate replacement batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DupBatchResult {
+    /// Number of replacements applied.
+    pub replacements_applied: usize,
+    /// Source leaf pages consumed.
+    pub source_pages: usize,
+    /// Destination leaf pages emitted.
+    pub destination_pages: usize,
+    /// Logical source bytes consumed.
+    pub source_bytes: usize,
+    /// Logical destination bytes emitted.
+    pub destination_bytes: usize,
+}
+
+/// Result of attempting a duplicate replacement batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DupBatchOutcome {
+    /// The engine atomically applied every replacement.
+    Applied(DupBatchResult),
+    /// The engine applied nothing and the caller may use ordinary cursor operations.
+    Unsupported(DupBatchFallbackReason),
+}
+
+/// Read Write Cursor over a `DupSort` table.
 pub trait DbDupCursorRW<T: DupSort> {
+    /// Atomically replace several exact duplicate values for one outer key.
+    ///
+    /// An [`DupBatchOutcome::Unsupported`] result guarantees that no replacement was applied.
+    fn replace_duplicates_batch(
+        &mut self,
+        key: T::Key,
+        replacements: &[DupBatchReplacement<T::Value>],
+    ) -> Result<DupBatchOutcome, DatabaseError>;
+
     /// Delete all duplicate entries for current key.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError>;
 

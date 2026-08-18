@@ -73,6 +73,54 @@ fn test_get_dup() {
 }
 
 #[test]
+fn test_mutate_batch_replaces_same_leaf_duplicates() {
+    fn value(index: u32, payload: u32) -> [u8; 8] {
+        let mut value = [0u8; 8];
+        value[..4].copy_from_slice(&index.to_be_bytes());
+        value[4..].copy_from_slice(&payload.to_be_bytes());
+        value
+    }
+
+    let dir = tempdir().unwrap();
+    let env = Environment::builder().open(dir.path()).unwrap();
+    let txn = env.begin_rw_txn().unwrap();
+    let dbi = txn.create_db(None, DatabaseFlags::DUP_SORT).unwrap().dbi();
+    let values = (0..500).map(|index| value(index, 0)).collect::<Vec<_>>();
+    for entry in &values {
+        txn.put(dbi, b"outer-key", entry, WriteFlags::NO_DUP_DATA).unwrap();
+    }
+
+    let after_100 = value(100, 0x1111_1111);
+    let after_101 = value(101, 0x2222_2222);
+    let mut cursor = txn.cursor(dbi).unwrap();
+    let outcome = cursor
+        .mutate_batch(
+            b"outer-key",
+            &[
+                BatchMutation { before: &values[100], after: &after_100 },
+                BatchMutation { before: &values[101], after: &after_101 },
+            ],
+        )
+        .unwrap();
+    let BatchOutcome::Applied(result) = outcome else {
+        panic!("expected the nested-leaf fast path, got {outcome:?}")
+    };
+    assert_eq!(result.mutations_applied, 2);
+    assert_eq!(result.source_pages, 1);
+    assert_eq!(result.destination_pages, result.source_pages);
+    assert!(result.source_bytes > 0);
+    assert_eq!(result.destination_bytes, result.source_bytes);
+    assert!(cursor.get_both::<()>(b"outer-key", &after_100).unwrap().is_some());
+    assert!(cursor.get_both::<()>(b"outer-key", &values[100]).unwrap().is_none());
+    drop(cursor);
+    txn.commit().unwrap();
+
+    let txn = env.begin_ro_txn().unwrap();
+    let mut cursor = txn.cursor(dbi).unwrap();
+    assert!(cursor.get_both::<()>(b"outer-key", &after_101).unwrap().is_some());
+}
+
+#[test]
 fn test_get_dupfixed() {
     let dir = tempdir().unwrap();
     let env = Environment::builder().open(dir.path()).unwrap();

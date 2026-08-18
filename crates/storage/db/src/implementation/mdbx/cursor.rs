@@ -8,14 +8,21 @@ use crate::{
 use reth_db_api::{
     common::{PairResult, ValueOnlyResult},
     cursor::{
-        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupWalker, RangeWalker,
+        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchFallbackReason,
+        DupBatchOutcome, DupBatchReplacement, DupBatchResult, DupWalker, RangeWalker,
         ReverseWalker, Walker,
     },
     table::{Compress, Decode, Decompress, DupSort, Encode, IntoVec, Table},
 };
-use reth_libmdbx::{Error as MDBXError, TransactionKind, WriteFlags, RO, RW};
+use reth_libmdbx::{
+    BatchFallbackReason as MDBXBatchFallbackReason, BatchMutation,
+    BatchOutcome as MDBXBatchOutcome, Error as MDBXError, TransactionKind, WriteFlags, RO, RW,
+};
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
-use std::{borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds, sync::Arc};
+use std::{
+    borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds, sync::Arc,
+    time::Instant,
+};
 
 /// Read only Cursor.
 pub type CursorRO<T> = Cursor<RO, T>;
@@ -31,6 +38,8 @@ pub struct Cursor<K: TransactionKind, T: Table> {
     buf: Vec<u8>,
     /// Reference to metric handles in the DB environment. If `None`, metrics are not recorded.
     metrics: Option<Arc<DatabaseEnvMetrics>>,
+    /// Encoded value size observed by the most recent instrumented seek.
+    last_read_value_size: Option<usize>,
     /// Phantom data to enforce encoding/decoding.
     _dbi: PhantomData<T>,
 }
@@ -40,7 +49,7 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
         inner: reth_libmdbx::Cursor<K>,
         metrics: Option<Arc<DatabaseEnvMetrics>>,
     ) -> Self {
-        Self { inner, buf: Vec::new(), metrics, _dbi: PhantomData }
+        Self { inner, buf: Vec::new(), metrics, last_read_value_size: None, _dbi: PhantomData }
     }
 
     /// If `self.metrics` is `Some(...)`, record a metric with the provided operation and value
@@ -57,6 +66,25 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
             metrics.record_operation(T::NAME, operation, value_size, || f(self))
         } else {
             f(self)
+        }
+    }
+
+    /// Records encoded bytes returned by an operation.
+    fn record_operation_result_bytes(&self, operation: Operation, result_size: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_operation_result_bytes(T::NAME, operation, result_size);
+        }
+    }
+
+    /// Records serialization work performed before a write operation.
+    fn record_serialization(
+        &self,
+        operation: Operation,
+        duration: std::time::Duration,
+        serialized_size: usize,
+    ) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_serialization(T::NAME, operation, duration, serialized_size);
         }
     }
 }
@@ -94,11 +122,43 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
     }
 
     fn seek_exact(&mut self, key: <T as Table>::Key) -> PairResult<T> {
-        decode::<T>(self.inner.set_key(key.encode().as_ref()))
+        let key = key.encode();
+        let result = self.execute_with_operation_metric(
+            Operation::CursorSeekExact,
+            Some(key.as_ref().len()),
+            |this| this.inner.set_key::<Cow<'_, [u8]>, Cow<'_, [u8]>>(key.as_ref()),
+        );
+        let result_size = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|(result_key, value)| result_key.len() + value.len());
+        self.last_read_value_size =
+            result.as_ref().ok().and_then(Option::as_ref).map(|(_, value)| value.len());
+        if let Some(result_size) = result_size {
+            self.record_operation_result_bytes(Operation::CursorSeekExact, result_size);
+        }
+        decode::<T>(result)
     }
 
     fn seek(&mut self, key: <T as Table>::Key) -> PairResult<T> {
-        decode::<T>(self.inner.set_range(key.encode().as_ref()))
+        let key = key.encode();
+        let result = self.execute_with_operation_metric(
+            Operation::CursorSeek,
+            Some(key.as_ref().len()),
+            |this| this.inner.set_range::<Cow<'_, [u8]>, Cow<'_, [u8]>>(key.as_ref()),
+        );
+        let result_size = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|(result_key, value)| result_key.len() + value.len());
+        self.last_read_value_size =
+            result.as_ref().ok().and_then(Option::as_ref).map(|(_, value)| value.len());
+        if let Some(result_size) = result_size {
+            self.record_operation_result_bytes(Operation::CursorSeek, result_size);
+        }
+        decode::<T>(result)
     }
 
     fn next(&mut self) -> PairResult<T> {
@@ -196,11 +256,19 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
         key: <T as Table>::Key,
         subkey: <T as DupSort>::SubKey,
     ) -> ValueOnlyResult<T> {
-        self.inner
-            .get_both_range(key.encode().as_ref(), subkey.encode().as_ref())
-            .map_err(|e| DatabaseError::Read(e.into()))?
-            .map(decode_one::<T>)
-            .transpose()
+        let key = key.encode();
+        let subkey = subkey.encode();
+        let result = self.execute_with_operation_metric(
+            Operation::CursorSeekByKeySubkey,
+            Some(key.as_ref().len() + subkey.as_ref().len()),
+            |this| this.inner.get_both_range::<Cow<'_, [u8]>>(key.as_ref(), subkey.as_ref()),
+        );
+        let result_size = result.as_ref().ok().and_then(Option::as_ref).map(|value| value.len());
+        self.last_read_value_size = result_size;
+        if let Some(result_size) = result_size {
+            self.record_operation_result_bytes(Operation::CursorSeekByKeySubkey, result_size);
+        }
+        result.map_err(|e| DatabaseError::Read(e.into()))?.map(decode_one::<T>).transpose()
     }
 
     /// Depending on its arguments, returns an iterator starting at:
@@ -256,10 +324,17 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     /// found, before calling `upsert`.
     fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorUpsert,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorUpsert,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::UPSERT)
@@ -276,12 +351,48 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
         )
     }
 
+    fn update_current(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
+        let key = key.encode();
+        let serialization_start = Instant::now();
+        let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorUpdateCurrent,
+            serialization_start.elapsed(),
+            value_size,
+        );
+        self.execute_with_operation_metric(
+            Operation::CursorUpdateCurrent,
+            Some(key.as_ref().len() + value_size),
+            |this| {
+                this.inner
+                    .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::CURRENT)
+                    .map_err(|e| {
+                        DatabaseWriteError {
+                            info: e.into(),
+                            operation: DatabaseWriteOperation::CursorUpdateCurrent,
+                            table_name: T::NAME,
+                            key: key.into_vec(),
+                        }
+                        .into()
+                    })
+            },
+        )
+    }
+
     fn insert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorInsert,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorInsert,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::NO_OVERWRITE)
@@ -302,10 +413,17 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     /// will fail if the inserted key is less than the last table key
     fn append(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorAppend,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorAppend,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::APPEND)
@@ -323,25 +441,143 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     }
 
     fn delete_current(&mut self) -> Result<(), DatabaseError> {
-        self.execute_with_operation_metric(Operation::CursorDeleteCurrent, None, |this| {
+        let value_size = self.last_read_value_size.take();
+        self.execute_with_operation_metric(Operation::CursorDeleteCurrent, value_size, |this| {
             this.inner.del(WriteFlags::CURRENT).map_err(|e| DatabaseError::Delete(e.into()))
         })
     }
 }
 
 impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
-    fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
-        self.execute_with_operation_metric(Operation::CursorDeleteCurrentDuplicates, None, |this| {
-            this.inner.del(WriteFlags::NO_DUP_DATA).map_err(|e| DatabaseError::Delete(e.into()))
+    fn replace_duplicates_batch(
+        &mut self,
+        key: T::Key,
+        replacements: &[DupBatchReplacement<T::Value>],
+    ) -> Result<DupBatchOutcome, DatabaseError> {
+        let key = key.encode();
+        let serialization_start = Instant::now();
+        let encoded = replacements
+            .iter()
+            .map(|replacement| {
+                let encode = |value: &T::Value| {
+                    if let Some(value) = value.uncompressable_ref() {
+                        value.to_vec()
+                    } else {
+                        let mut buf = Vec::new();
+                        value.compress_to_buf(&mut buf);
+                        buf
+                    }
+                };
+                (encode(&replacement.before), encode(&replacement.after))
+            })
+            .collect::<Vec<_>>();
+        let serialized_size =
+            encoded.iter().map(|(before, after)| before.len() + after.len()).sum::<usize>();
+        self.record_serialization(
+            Operation::CursorBatchReplace,
+            serialization_start.elapsed(),
+            serialized_size,
+        );
+        let mutations = encoded
+            .iter()
+            .map(|(before, after)| BatchMutation { before, after })
+            .collect::<Vec<_>>();
+        let outcome = self.execute_with_operation_metric(
+            Operation::CursorBatchReplace,
+            Some(key.as_ref().len() + serialized_size),
+            |this| {
+                this.inner.mutate_batch(key.as_ref(), &mutations).map_err(|e| {
+                    DatabaseError::from(DatabaseWriteError {
+                        info: e.into(),
+                        operation: DatabaseWriteOperation::CursorBatchReplace,
+                        table_name: T::NAME,
+                        key: key.as_ref().to_vec(),
+                    })
+                })
+            },
+        )?;
+
+        Ok(match outcome {
+            MDBXBatchOutcome::Applied(result) => {
+                self.record_operation_result_bytes(
+                    Operation::CursorBatchReplace,
+                    result.destination_bytes,
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_page_batch_applied(
+                        T::NAME,
+                        result.mutations_applied,
+                        result.source_pages,
+                        result.destination_pages,
+                        result.source_bytes,
+                        result.destination_bytes,
+                    );
+                }
+                DupBatchOutcome::Applied(DupBatchResult {
+                    replacements_applied: result.mutations_applied,
+                    source_pages: result.source_pages,
+                    destination_pages: result.destination_pages,
+                    source_bytes: result.source_bytes,
+                    destination_bytes: result.destination_bytes,
+                })
+            }
+            MDBXBatchOutcome::Unsupported(reason) => {
+                let (reason, label) = match reason {
+                    MDBXBatchFallbackReason::UnsupportedTable => {
+                        (DupBatchFallbackReason::UnsupportedTable, "unsupported-table")
+                    }
+                    MDBXBatchFallbackReason::UnsupportedOperation => {
+                        (DupBatchFallbackReason::UnsupportedOperation, "unsupported-operation")
+                    }
+                    MDBXBatchFallbackReason::ValueSize => {
+                        (DupBatchFallbackReason::ValueSize, "value-size")
+                    }
+                    MDBXBatchFallbackReason::NotFound => {
+                        (DupBatchFallbackReason::NotFound, "not-found")
+                    }
+                    MDBXBatchFallbackReason::MultipleLeaves => {
+                        (DupBatchFallbackReason::MultipleLeaves, "multiple-leaves")
+                    }
+                    MDBXBatchFallbackReason::Subpage => {
+                        (DupBatchFallbackReason::Subpage, "subpage")
+                    }
+                    MDBXBatchFallbackReason::Order => (DupBatchFallbackReason::Order, "order"),
+                    MDBXBatchFallbackReason::Unknown(reason) => {
+                        (DupBatchFallbackReason::Unknown(reason), "unknown")
+                    }
+                };
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_page_batch_fallback(T::NAME, label);
+                }
+                DupBatchOutcome::Unsupported(reason)
+            }
         })
+    }
+
+    fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
+        let value_size = self.last_read_value_size.take();
+        self.execute_with_operation_metric(
+            Operation::CursorDeleteCurrentDuplicates,
+            value_size,
+            |this| {
+                this.inner.del(WriteFlags::NO_DUP_DATA).map_err(|e| DatabaseError::Delete(e.into()))
+            },
+        )
     }
 
     fn append_dup(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
+        let serialization_start = Instant::now();
         let value = compress_to_buf_or_ref!(self, value);
+        let value_size = value.unwrap_or(&self.buf).len();
+        self.record_serialization(
+            Operation::CursorAppendDup,
+            serialization_start.elapsed(),
+            value_size,
+        );
         self.execute_with_operation_metric(
             Operation::CursorAppendDup,
-            Some(value.unwrap_or(&self.buf).len()),
+            Some(key.as_ref().len() + value_size),
             |this| {
                 this.inner
                     .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::APPEND_DUP)
@@ -363,12 +599,12 @@ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
 mod tests {
     use crate::{
         mdbx::{DatabaseArguments, DatabaseEnv, DatabaseEnvKind},
-        tables::StorageChangeSets,
+        tables::{HashedStorages, StorageChangeSets},
         Database,
     };
     use alloy_primitives::{address, Address, B256, U256};
     use reth_db_api::{
-        cursor::{DbCursorRO, DbDupCursorRW},
+        cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW, DupBatchOutcome, DupBatchReplacement},
         models::{BlockNumberAddress, ClientVersion},
         table::TableImporter,
         transaction::{DbTx, DbTxMut},
@@ -386,6 +622,53 @@ mod tests {
         .unwrap();
         db.create_tables().unwrap();
         db
+    }
+
+    #[test]
+    fn test_typed_dupsort_batch_replaces_multiple_pages() {
+        fn slot(index: u32) -> B256 {
+            let mut bytes = [0; 32];
+            bytes[28..].copy_from_slice(&index.to_be_bytes());
+            B256::from(bytes)
+        }
+
+        let db = create_test_db();
+        let tx = db.tx_mut().unwrap();
+        let address = B256::repeat_byte(0x42);
+        let entries = (0..1000)
+            .map(|index| StorageEntry { key: slot(index), value: U256::from(1000 + index) })
+            .collect::<Vec<_>>();
+        let mut cursor = tx.cursor_dup_write::<HashedStorages>().unwrap();
+        for entry in &entries {
+            cursor.append_dup(address, *entry).unwrap();
+        }
+        drop(cursor);
+        tx.commit().unwrap();
+
+        // Exercise clean COW paths rather than updating pages that are still
+        // dirty from fixture creation.
+        let tx = db.tx_mut().unwrap();
+        let mut cursor = tx.cursor_dup_write::<HashedStorages>().unwrap();
+
+        let after_100 = StorageEntry { key: slot(100), value: U256::from(2100) };
+        let after_600 = StorageEntry { key: slot(600), value: U256::from(2600) };
+        let outcome = cursor
+            .replace_duplicates_batch(
+                address,
+                &[
+                    DupBatchReplacement { before: entries[100], after: after_100 },
+                    DupBatchReplacement { before: entries[600], after: after_600 },
+                ],
+            )
+            .unwrap();
+        let DupBatchOutcome::Applied(result) = outcome else {
+            panic!("expected typed MDBX batch fast path, got {outcome:?}")
+        };
+        assert_eq!(result.replacements_applied, 2);
+        assert!(result.source_pages >= 2);
+        assert_eq!(result.destination_pages, result.source_pages);
+        assert_eq!(cursor.seek_by_key_subkey(address, slot(100)).unwrap(), Some(after_100));
+        assert_eq!(cursor.seek_by_key_subkey(address, slot(600)).unwrap(), Some(after_600));
     }
 
     #[test]
