@@ -99,6 +99,75 @@ original runner also exited before serializing process CPU samples, and its orph
 stopped; those two metrics are intentionally excluded. The exact recovery procedure is implemented
 by `research/reth-2.0-fpga/scripts/recover_locked_corpus_tail.py`.
 
+## Direct COW-phase attribution
+
+A separate low-overhead attribution run used the same frozen 20-block warm-up and 100-block slice,
+the accepted threshold-32 configuration, and no stack profiler. The measurement-only build retained
+the original cursor delete/upsert hot paths rather than the rejected page-batch prototype. Its
+source was commit `dd88ea7ac883c5850338bb2884f72202edd3b456` plus recorded diff SHA-256
+`21701cb2c5db395ea77f50a78864810717fe063224db45fd19e5cc3bd2aa7b77`; the Reth binary SHA-256
+was `54a7aa8aa1576889bc436b569c7478276a161ba5c19cfe6378e853baf733205a`.
+
+The run injected 100 blocks in 435.573 seconds, only 0.16% slower than the 434.895-second batch-33
+control. Its excluded durability drain took 126.179 seconds, for 561.752 seconds injection plus
+drain. Cold reopen matched the expected hash and state root at block `25661283`.
+
+At the injection boundary, three 33-block saves had completed and two blocks remained in memory.
+The phase counters account for 519,764 of 519,803 transaction COW operations (99.9925%):
+
+| Persistence phase | COW operations | COW share | Phase time | Splits |
+|---|---:|---:|---:|---:|
+| `write-storage-trie` | 242,458 | 46.64% | 191.839 s | 145 |
+| `write-hashed-state` | 163,258 | 31.41% | 126.777 s | 252 |
+| `write-account-trie` | 113,533 | 21.84% | 92.329 s | 57 |
+| `insert-block` | 329 | 0.06% | 0.438 s | 22 |
+| `write-state` | 186 | 0.04% | 0.309 s | 1 |
+| Unattributed residual | 39 | 0.01% | n/a | n/a |
+
+The cursor timers identify the concrete operations below. Durations are aggregate timers and can
+overlap when work is concurrent, so they rank targets but must not be added to obtain wall time.
+
+| Table and operation | Aggregate time | Calls | Logical/result/serialized bytes |
+|---|---:|---:|---:|
+| `StoragesTrie cursor-delete-current` | 168.342 s | 157,788 | 66.607 MB deleted |
+| `AccountsTrie cursor-upsert` | 92.242 s | 112,743 | 50.902 / 0 / 47.181 MB |
+| `HashedStorages cursor-delete-current` | 69.538 s | 45,277 | 1.914 MB deleted |
+| `StoragesTrie cursor-seek-by-key-subkey` | 50.124 s | 1,114,740 | 72.458 / 455.867 / 0 MB |
+| `HashedStorages cursor-seek-by-key-subkey` | 40.142 s | 552,158 | 35.338 / 24.784 / 0 MB |
+| `HashedStorages cursor-upsert` | 29.265 s | 45,504 | 3.415 / 0 / 1.959 MB |
+| `AccountsTrie cursor-seek` | 28.323 s | 630,486 | 20.806 / 284.882 / 0 MB |
+| `HashedAccounts cursor-upsert` | 27.681 s | 26,284 | 1.308 / 0 / 0.467 MB |
+| `StoragesTrie cursor-upsert` | 22.711 s | 157,801 | 71.651 / 0 / 66.601 MB |
+
+Node serialization across every nonzero instrumented operation was only 0.110 seconds, and trie
+batch merging was 0.025 seconds. Neither is a supported primary target. The block/static-data path
+was also negligible: for example, all 99 `HeaderNumbers put-upsert` calls took 0.335 seconds.
+
+### I/O work to remove
+
+The same injection boundary recorded 694,564 dirty-page equivalents (2.845 GB), 519,803 COW page
+operations, 483 splits, and 455,806 MDBX prefault `pwrite`/`pwritev` operations. libMDBX does not
+export each vector length, but one 4 KiB database page per prefault operation gives a strict lower
+bound of 1.867 GB written by those calls. Device `iostat` is system-wide and is therefore retained
+only as supporting evidence, not attributed to Reth bytes.
+
+There were six read-write commits and 7.938 seconds of commit sync during injection. In contrast,
+the three `save_blocks` calls consumed 420.876 seconds. The optimization target is therefore the
+number of COW page images and prefault writes before commit, not an fsync-only accelerator.
+
+## Flame graphs
+
+The retained Samply batch-17 discovery profile is independent stack evidence for the page counters.
+Its CPU leaves were `pwrite` 34.07%, `page_touch_unmodifable` 22.93%, `_platform_memmove` 13.30%,
+`cursor_del` 4.80%, and `cursor_put` 4.51% of profiled CPU. The first three account for 70.70%.
+The off-CPU graph is dominated by condition-variable waits, led by
+`tokio-rt | __psynch_cvwait` at 12.09% of weighted off-CPU samples. The flame graph and direct
+phase-attribution runs were intentionally not simultaneous.
+
+![CPU flame graph](assets/cow-benchmark/flamegraph-cpu.svg)
+
+![Off-CPU flame graph](assets/cow-benchmark/flamegraph-offcpu.svg)
+
 ## Decision
 
 Batch 33 is accepted as the COW-throughput research candidate. It gives a reproducible reduction in
@@ -113,13 +182,17 @@ pages, and block count, rather than a fixed block count alone.
 
 After this software reduction, the remaining hardware-relevant path is narrower:
 
-1. coalesce sorted storage-trie delete/upsert mutations by destination leaf;
-2. build each final 4 KiB page once, including compaction and slot/offset repair;
-3. emit contiguous page-write descriptors while MDBX retains MVCC, allocation, commit ordering,
-   and recovery ownership.
+1. add a transaction-local `StoragesTrie` mutation buffer that groups sorted delete/upsert pairs by
+   destination leaf and constructs each final leaf once; this directly targets 46.64% of COW and
+   the 168.342-second delete-current aggregate;
+2. apply the same leaf-local final-page construction to `HashedStorages`/`HashedAccounts`, targeting
+   the 31.41% hashed-state COW share and its delete/seek/upsert sequence;
+3. group `AccountsTrie` upserts by destination leaf, targeting the remaining 21.84% account-trie
+   COW share;
+4. coalesce adjacent dirty-page descriptors so MDBX issues fewer prefault writes and bytes while it
+   retains MVCC visibility, page allocation, commit ordering, durability, and recovery ownership.
 
-The new low-overhead page-operation attribution records MDBX COW/new/split/merge/spill deltas for
-`insert-block`, `write-state`, `write-hashed-state`, `write-account-trie`, and
-`write-storage-trie`. A binary containing that instrumentation is required before assigning the
-remaining 5,026 COW pages per block to exact phases; the retained benchmark binary was deliberately
-not rebuilt during the fair 17/33 comparison.
+These are software changes first. Re-profile after each step. FPGA offload is justified only if the
+reduced path remains dominated by `page_touch_unmodifable`, `memmove`, final-page slot/offset repair,
+and `pwrite` descriptor generation; hashing, serialization, merge-batch, static files, and fsync are
+not supported FPGA priorities in this corpus.

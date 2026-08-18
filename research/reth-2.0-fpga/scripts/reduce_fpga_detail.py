@@ -156,23 +156,23 @@ def main() -> int:
         if name != "reth_storage_providers_database_page_ops_total":
             continue
         label_map = dict(labels)
-        phase = label_map.get("phase", "")
+        phase_name = label_map.get("phase", "")
         operation = label_map.get("operation", "")
-        if not phase or not operation or value <= before.get((name, labels), 0):
+        if not phase_name or not operation or value <= before.get((name, labels), 0):
             continue
-        page_ops_by_phase.setdefault(phase, {})[operation] = int(
+        page_ops_by_phase.setdefault(phase_name, {})[operation] = int(
             round(
                 delta(
                     before,
                     after,
                     "reth_storage_providers_database_page_ops_total",
-                    {"phase": phase, "operation": operation},
+                    {"phase": phase_name, "operation": operation},
                 )
             )
         )
     page_ops_by_phase = {
-        phase: dict(sorted(operations.items()))
-        for phase, operations in sorted(page_ops_by_phase.items())
+        phase_name: dict(sorted(operations.items()))
+        for phase_name, operations in sorted(page_ops_by_phase.items())
     }
 
     page_batch_tables = sorted(
