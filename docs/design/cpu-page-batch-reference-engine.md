@@ -1,9 +1,11 @@
 # CPU page-batch reference engine for Reth state persistence
 
-Status: implemented CPU reference prototype, correctness-tested and measured on the frozen Reth
-v2 workload. The first custom libMDBX API is intentionally narrow: it batches exact, same-size
-replacements for one DUPSORT outer key. The deterministic 100-block discovery run rejected this
-version as a performance candidate, so it is a research control rather than a production backend.
+Status: two CPU reference prototypes are implemented, correctness-tested, and measured on the
+frozen Reth v2 workload. The first custom libMDBX API batched exact, same-size replacements. The
+second accepted delete/upsert/variable-size mutation streams and built complete destination leaves.
+Neither reduced unique transaction COW pages, so both are research controls rather than a
+production backend. See the [final-page builder report](./mdbx-final-page-builder-benchmark-report.md)
+for the second result.
 
 ## Problem statement
 
@@ -157,14 +159,19 @@ ratio also show that this run is dominated by persistence/off-CPU time rather th
 CPU bottleneck. A full 500-block confirmation was intentionally not run because the discovery gate
 failed.
 
-## Required next implementation
+## Final-page implementation result
 
-The next CPU reference must accept a complete ordered mutation stream—delete, insert, and replace—
-for an outer key, coalesce it by logical subkey, and construct the final leaf image(s) once. It must
-avoid the prototype's per-record exact seeks and repeated `cursor_touch()` validation, and it must
-measure actual unique dirty/COW pages rather than reporting requested source pages as savings.
-Only a valid 100-block result that reduces unique COW/page-touch work and wall clock beyond run
-variance should advance to the 500-block confirmation or an FPGA implementation.
+The second CPU reference accepts complete ordered delete, upsert, and variable-size replacement
+streams, validates and constructs all destination leaves before transaction mutation, touches each
+supported leaf path once, copies the packed image once, and atomically falls back for unsupported
+layouts. It was applied to 76.48% of hashed-storage batches and 58.82% of storage-trie batches.
+
+On the matched deterministic 100-block run it improved injection wall time by 4.13% and process
+CPU by 4.06%, but COW pages increased from 986,549 to 987,128. Source and destination page counts
+were identical inside every successful batch. The result confirms that MDBX already deduplicates
+the first COW of a unique page within a transaction: final-page construction can reduce subsequent
+row manipulation, but it cannot remove that mandatory copy. The COW gate failed, so this candidate
+did not advance to 500 blocks or FPGA implementation.
 
 ## Required semantics
 

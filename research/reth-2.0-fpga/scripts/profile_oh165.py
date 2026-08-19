@@ -716,7 +716,7 @@ def main() -> int:
             "profiler": args.profiler,
             "profiler_isolation": {"simultaneous_stack_profilers": 1 if args.profiler == "samply" else 0, "samply_rate_hz": 99 if args.profiler == "samply" else None},
             "frozen_input_guardrail": frozen_guard,
-            "source_commit": SOURCE_COMMIT,
+            "source_commit": frozen_guard["observed"]["source_commit"],
             "engine": {
                 "persistence_threshold": args.persistence_threshold,
                 "persistence_backpressure_threshold": persistence_backpressure_threshold,

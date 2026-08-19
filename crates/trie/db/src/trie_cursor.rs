@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use reth_db_api::{
     cursor::{
-        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchOutcome, DupBatchReplacement,
+        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchMutation, DupBatchOutcome,
     },
     table::{DupSort, Key, Table, Value},
     tables::{self, PackedAccountsTrie, PackedStoragesTrie},
@@ -289,9 +289,7 @@ where
         }
 
         let mut num_entries = 0;
-        let mut replacements = Vec::new();
-        let mut deletes = Vec::new();
-        let mut upserts = Vec::new();
+        let mut mutations = Vec::new();
         for (nibbles, maybe_updated) in updates.storage_nodes.iter().filter(|(n, _)| !n.is_empty())
         {
             num_entries += 1;
@@ -302,40 +300,47 @@ where
                 .filter(|entry| *entry.nibbles() == nibbles);
 
             match (existing, maybe_updated) {
-                (Some(before), Some(node)) => replacements.push(DupBatchReplacement {
+                (Some(before), Some(node)) => mutations.push(DupBatchMutation::Replace {
                     before,
                     after: A::StorageValue::new(nibbles, node.clone()),
                 }),
-                (Some(_), None) => deletes.push(nibbles),
-                (None, Some(node)) => upserts.push(A::StorageValue::new(nibbles, node.clone())),
+                (Some(before), None) => mutations.push(DupBatchMutation::Delete { before }),
+                (None, Some(node)) => mutations.push(DupBatchMutation::Upsert {
+                    after: A::StorageValue::new(nibbles, node.clone()),
+                }),
                 (None, None) => {}
             }
         }
 
-        if !replacements.is_empty() &&
+        if !mutations.is_empty() &&
             matches!(
-                self.cursor.replace_duplicates_batch(self.hashed_address, &replacements)?,
+                self.cursor.mutate_duplicates_batch(self.hashed_address, &mutations)?,
                 DupBatchOutcome::Unsupported(_)
             )
         {
-            for replacement in &replacements {
-                let subkey = replacement.before.nibbles().clone();
-                let current =
-                    self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
-                if current.as_ref().is_some_and(|entry| *entry.nibbles() == subkey) {
-                    self.cursor.update_current(self.hashed_address, &replacement.after)?;
+            for mutation in &mutations {
+                match mutation {
+                    DupBatchMutation::Delete { before } => {
+                        let subkey = before.nibbles().clone();
+                        let current =
+                            self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
+                        if current.as_ref().is_some_and(|entry| *entry.nibbles() == subkey) {
+                            self.cursor.delete_current()?;
+                        }
+                    }
+                    DupBatchMutation::Upsert { after } => {
+                        self.cursor.upsert(self.hashed_address, after)?;
+                    }
+                    DupBatchMutation::Replace { before, after } => {
+                        let subkey = before.nibbles().clone();
+                        let current =
+                            self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
+                        if current.as_ref().is_some_and(|entry| *entry.nibbles() == subkey) {
+                            self.cursor.update_current(self.hashed_address, after)?;
+                        }
+                    }
                 }
             }
-        }
-
-        for subkey in deletes {
-            let current = self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
-            if current.as_ref().is_some_and(|entry| *entry.nibbles() == subkey) {
-                self.cursor.delete_current()?;
-            }
-        }
-        for entry in upserts {
-            self.cursor.upsert(self.hashed_address, &entry)?;
         }
 
         Ok(num_entries)

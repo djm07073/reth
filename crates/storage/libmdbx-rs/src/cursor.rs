@@ -13,13 +13,15 @@ use ffi::{
 };
 use std::{borrow::Cow, ffi::c_void, fmt, marker::PhantomData, mem, ptr};
 
-/// One exact duplicate replacement for [`Cursor::mutate_batch`].
+/// One duplicate mutation for [`Cursor::mutate_batch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BatchMutation<'a> {
-    /// Existing encoded duplicate value.
-    pub before: &'a [u8],
-    /// Replacement encoded duplicate value.
-    pub after: &'a [u8],
+pub enum BatchMutation<'a> {
+    /// Delete an exact existing duplicate.
+    Delete { before: &'a [u8] },
+    /// Insert a duplicate which does not already exist.
+    Upsert { after: &'a [u8] },
+    /// Replace an exact existing duplicate with its final value.
+    Replace { before: &'a [u8], after: &'a [u8] },
 }
 
 /// Reason the MDBX batch fast path declined a batch before applying mutations.
@@ -39,6 +41,14 @@ pub enum BatchFallbackReason {
     Subpage,
     /// Input or resulting duplicate order is unsupported.
     Order,
+    /// The packed destination requires an additional leaf page.
+    PageFull,
+    /// The mutation stream removes a complete leaf page.
+    EmptyPage,
+    /// An upsert already exists or a replacement collides with another duplicate.
+    Conflict,
+    /// Another cursor is positioned on the same outer duplicate record.
+    PeerCursor,
     /// A newer libMDBX fork returned an unknown reason.
     Unknown(u32),
 }
@@ -46,7 +56,7 @@ pub enum BatchFallbackReason {
 /// Counters returned by the MDBX page-batch reference path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BatchResult {
-    /// Number of replacements applied.
+    /// Number of mutations applied.
     pub mutations_applied: usize,
     /// Source leaf pages read by the fast path.
     pub source_pages: usize,
@@ -61,7 +71,7 @@ pub struct BatchResult {
 /// Outcome of attempting an MDBX page-batch mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchOutcome {
-    /// The fast path applied all replacements.
+    /// The fast path applied all mutations.
     Applied(BatchResult),
     /// The fast path made no changes; the caller may use sequential operations.
     Unsupported(BatchFallbackReason),
@@ -485,7 +495,7 @@ where
 }
 
 impl Cursor<RW> {
-    /// Attempts to replace several exact duplicates for one outer key as one MDBX leaf mutation.
+    /// Attempts to apply a complete ordered duplicate mutation stream as final MDBX leaf images.
     ///
     /// [`BatchOutcome::Unsupported`] is atomic: MDBX validates the complete batch before touching
     /// database contents, so the caller may safely fall back to ordinary cursor operations.
@@ -498,19 +508,29 @@ impl Cursor<RW> {
             iov_len: key.len(),
             iov_base: key.as_ptr().cast_mut().cast::<c_void>(),
         };
+        let value = |bytes: Option<&[u8]>| ffi::MDBX_val {
+            iov_len: bytes.map_or(0, <[u8]>::len),
+            iov_base: bytes
+                .map_or(ptr::null_mut(), |bytes| bytes.as_ptr().cast_mut().cast::<c_void>()),
+        };
         let raw_mutations = mutations
             .iter()
-            .map(|mutation| ffi::MDBX_batch_mutation {
-                before: ffi::MDBX_val {
-                    iov_len: mutation.before.len(),
-                    iov_base: mutation.before.as_ptr().cast_mut().cast::<c_void>(),
-                },
-                after: ffi::MDBX_val {
-                    iov_len: mutation.after.len(),
-                    iov_base: mutation.after.as_ptr().cast_mut().cast::<c_void>(),
-                },
-                op: ffi::MDBX_BATCH_REPLACE,
-                reserved: 0,
+            .map(|mutation| {
+                let (before, after, op) = match mutation {
+                    BatchMutation::Delete { before } => {
+                        (Some(*before), None, ffi::MDBX_BATCH_DELETE)
+                    }
+                    BatchMutation::Upsert { after } => (None, Some(*after), ffi::MDBX_BATCH_UPSERT),
+                    BatchMutation::Replace { before, after } => {
+                        (Some(*before), Some(*after), ffi::MDBX_BATCH_REPLACE)
+                    }
+                };
+                ffi::MDBX_batch_mutation {
+                    before: value(before),
+                    after: value(after),
+                    op,
+                    reserved: 0,
+                }
             })
             .collect::<Vec<_>>();
         let mut raw_result = ffi::MDBX_batch_result {
@@ -545,6 +565,10 @@ impl Cursor<RW> {
                 ffi::MDBX_BATCH_FALLBACK_MULTIPLE_LEAVES => BatchFallbackReason::MultipleLeaves,
                 ffi::MDBX_BATCH_FALLBACK_SUBPAGE => BatchFallbackReason::Subpage,
                 ffi::MDBX_BATCH_FALLBACK_ORDER => BatchFallbackReason::Order,
+                ffi::MDBX_BATCH_FALLBACK_PAGE_FULL => BatchFallbackReason::PageFull,
+                ffi::MDBX_BATCH_FALLBACK_EMPTY_PAGE => BatchFallbackReason::EmptyPage,
+                ffi::MDBX_BATCH_FALLBACK_CONFLICT => BatchFallbackReason::Conflict,
+                ffi::MDBX_BATCH_FALLBACK_PEER_CURSOR => BatchFallbackReason::PeerCursor,
                 other => BatchFallbackReason::Unknown(other),
             };
             return Ok(BatchOutcome::Unsupported(reason));

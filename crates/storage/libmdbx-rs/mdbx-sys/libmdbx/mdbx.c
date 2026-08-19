@@ -8947,6 +8947,92 @@ MDBX_dbi mdbx_cursor_dbi(const MDBX_cursor *mc) {
 
 /*----------------------------------------------------------------------------*/
 
+typedef struct batch_location {
+  MDBX_cursor *inner;
+  const page_t *leaf;
+  size_t slot;
+  bool exact;
+} batch_location_t;
+
+static MDBX_val batch_leaf_key(const MDBX_cursor *inner, const page_t *leaf, size_t slot) {
+  return is_dupfix_leaf(leaf) ? page_dupfix_key(leaf, slot, inner->tree->dupfix_size)
+                              : get_key(page_node(leaf, slot));
+}
+
+/* Repacking changes leaf indices in one step. Ordinary node insertion/deletion
+ * adjusts every related cursor incrementally; decline the fast path when a
+ * second cursor is positioned on the same outer DUPSORT record. */
+static bool batch_has_peer_cursor(const MDBX_cursor *mc) {
+  for (const MDBX_cursor *peer = mc->txn->cursors[cursor_dbi(mc)]; peer; peer = peer->next)
+    if (peer != mc && is_filled(peer) && peer->top == mc->top && peer->pg[peer->top] == mc->pg[mc->top] &&
+        peer->ki[peer->top] == mc->ki[mc->top])
+      return true;
+  return false;
+}
+
+/* Position a DUPSORT nested cursor without modifying pages. Exact lookups are
+ * used by delete/replace; range lookups select the destination leaf and slot
+ * for an upsert. A range beyond the final duplicate is assigned to the last
+ * leaf. */
+static int batch_locate(MDBX_cursor *mc, const MDBX_val *outer_key, const MDBX_val *value, bool exact_required,
+                        batch_location_t *location, uint32_t *fallback_reason) {
+  MDBX_val seek_key = *outer_key;
+  MDBX_val seek_data = *value;
+  int rc = cursor_ops(mc, &seek_key, &seek_data, exact_required ? MDBX_GET_BOTH : MDBX_GET_BOTH_RANGE);
+  if (!exact_required && rc == MDBX_NOTFOUND) {
+    seek_key = *outer_key;
+    seek_data.iov_base = nullptr;
+    seek_data.iov_len = 0;
+    rc = cursor_ops(mc, &seek_key, &seek_data, MDBX_SET);
+    if (rc == MDBX_NOTFOUND) {
+      *fallback_reason = MDBX_BATCH_FALLBACK_NOT_FOUND;
+      return MDBX_RESULT_TRUE;
+    }
+    if (unlikely(rc != MDBX_SUCCESS))
+      return rc;
+  } else if (rc == MDBX_NOTFOUND) {
+    *fallback_reason = MDBX_BATCH_FALLBACK_NOT_FOUND;
+    return MDBX_RESULT_TRUE;
+  } else if (unlikely(rc != MDBX_SUCCESS)) {
+    return rc;
+  }
+
+  if (unlikely(!inner_filled(mc))) {
+    *fallback_reason = MDBX_BATCH_FALLBACK_NOT_FOUND;
+    return MDBX_RESULT_TRUE;
+  }
+  const node_t *const outer_node = page_node(mc->pg[mc->top], mc->ki[mc->top]);
+  if (unlikely((node_flags(outer_node) & (N_DUP | N_TREE)) != (N_DUP | N_TREE))) {
+    *fallback_reason = MDBX_BATCH_FALLBACK_SUBPAGE;
+    return MDBX_RESULT_TRUE;
+  }
+
+  MDBX_cursor *const inner = &mc->subcur->cursor;
+  if (!exact_required && rc == MDBX_SUCCESS) {
+    /* MDBX_SET above positions the nested cursor on the first duplicate. A
+     * range miss means the requested value belongs after the final duplicate. */
+    MDBX_val current = batch_leaf_key(inner, inner->pg[inner->top], inner->ki[inner->top]);
+    if (inner->clc->k.cmp(value, &current) > 0) {
+      rc = inner_last(inner, &current);
+      if (unlikely(rc != MDBX_SUCCESS))
+        return rc;
+    }
+  }
+
+  const page_t *const leaf = inner->pg[inner->top];
+  const size_t slot = inner->ki[inner->top];
+  const MDBX_val current = batch_leaf_key(inner, leaf, slot);
+  location->inner = inner;
+  location->leaf = leaf;
+  location->slot = slot;
+  location->exact = inner->clc->k.cmp(value, &current) == 0;
+  if (exact_required && unlikely(!location->exact)) {
+    *fallback_reason = MDBX_BATCH_FALLBACK_NOT_FOUND;
+    return MDBX_RESULT_TRUE;
+  }
+  return MDBX_SUCCESS;
+}
+
 int mdbx_cursor_mutate_batch(MDBX_cursor *mc, const MDBX_val *key, const MDBX_batch_mutation *mutations,
                              size_t mutation_count, MDBX_batch_result *result) {
   if (unlikely(result == nullptr || key == nullptr || (mutation_count && mutations == nullptr)))
@@ -8962,8 +9048,22 @@ int mdbx_cursor_mutate_batch(MDBX_cursor *mc, const MDBX_val *key, const MDBX_ba
   typedef struct batch_slot {
     pgno_t pgno;
     size_t slot;
+    MDBX_val anchor;
   } batch_slot_t;
+  typedef struct batch_page_plan {
+    pgno_t source_pgno;
+    size_t mutation_index;
+    size_t source_nkeys;
+    size_t destination_nkeys;
+    size_t source_bytes;
+    size_t destination_bytes;
+    bool anchor_exact;
+    bool first_changed;
+    page_t *destination;
+  } batch_page_plan_t;
   batch_slot_t *slots = nullptr;
+  batch_page_plan_t *plans = nullptr;
+  size_t plan_count = 0;
 
 #define BATCH_FALLBACK(REASON)                                                                                         \
   do {                                                                                                                 \
@@ -8974,112 +9074,219 @@ int mdbx_cursor_mutate_batch(MDBX_cursor *mc, const MDBX_val *key, const MDBX_ba
 
   if (unlikely(mc->subcur == nullptr || (mc->tree->flags & MDBX_DUPSORT) == 0))
     BATCH_FALLBACK(MDBX_BATCH_FALLBACK_UNSUPPORTED_TABLE);
-  if (unlikely(mutation_count > PTRDIFF_MAX / sizeof(batch_slot_t))) {
+  if (unlikely(mutation_count > PTRDIFF_MAX / sizeof(batch_slot_t) ||
+               mutation_count > PTRDIFF_MAX / sizeof(batch_page_plan_t))) {
     rc = MDBX_TOO_LARGE;
     goto bailout;
   }
 
   slots = osal_malloc(mutation_count * sizeof(batch_slot_t));
-  if (unlikely(slots == nullptr)) {
+  plans = osal_calloc(mutation_count, sizeof(batch_page_plan_t));
+  if (unlikely(slots == nullptr || plans == nullptr)) {
     rc = MDBX_ENOMEM;
     goto bailout;
   }
 
   MDBX_cursor *inner = nullptr;
+  MDBX_val previous_anchor = {nullptr, 0};
   for (size_t i = 0; i < mutation_count; ++i) {
     const MDBX_batch_mutation *const mutation = &mutations[i];
-    if (unlikely(mutation->op != MDBX_BATCH_REPLACE || mutation->reserved != 0))
+    if (unlikely(mutation->reserved != 0 ||
+                 (mutation->op != MDBX_BATCH_REPLACE && mutation->op != MDBX_BATCH_DELETE &&
+                  mutation->op != MDBX_BATCH_UPSERT)))
       BATCH_FALLBACK(MDBX_BATCH_FALLBACK_UNSUPPORTED_OPERATION);
-    if (unlikely(mutation->before.iov_len != mutation->after.iov_len))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_VALUE_SIZE);
 
-    MDBX_val seek_key = *key;
-    MDBX_val seek_data = mutation->before;
-    rc = cursor_ops(mc, &seek_key, &seek_data, MDBX_GET_BOTH);
-    if (unlikely(rc == MDBX_NOTFOUND))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_NOT_FOUND);
+    const bool upsert = mutation->op == MDBX_BATCH_UPSERT;
+    if (unlikely((upsert && mutation->before.iov_len != 0) ||
+                 (mutation->op == MDBX_BATCH_DELETE && mutation->after.iov_len != 0)))
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_UNSUPPORTED_OPERATION);
+    MDBX_val anchor = upsert ? mutation->after : mutation->before;
+    if (unlikely(anchor.iov_len == 0))
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_UNSUPPORTED_OPERATION);
+    if (i && unlikely(mc->clc->v.cmp(&previous_anchor, &anchor) >= 0))
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
+    previous_anchor = anchor;
+
+    batch_location_t location;
+    uint32_t fallback_reason = MDBX_BATCH_FALLBACK_NONE;
+    rc = batch_locate(mc, key, &anchor, !upsert, &location, &fallback_reason);
+    if (rc == MDBX_RESULT_TRUE)
+      BATCH_FALLBACK(fallback_reason);
     if (unlikely(rc != MDBX_SUCCESS))
       goto bailout;
-    if (unlikely(!inner_filled(mc)))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_NOT_FOUND);
+    if (i == 0 && unlikely(batch_has_peer_cursor(mc)))
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_PEER_CURSOR);
+    if (upsert && unlikely(location.exact))
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_CONFLICT);
 
-    const node_t *const outer_node = page_node(mc->pg[mc->top], mc->ki[mc->top]);
-    if (unlikely((node_flags(outer_node) & (N_DUP | N_TREE)) != (N_DUP | N_TREE)))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_SUBPAGE);
+    if (mutation->op == MDBX_BATCH_REPLACE) {
+      batch_location_t destination;
+      fallback_reason = MDBX_BATCH_FALLBACK_NONE;
+      rc = batch_locate(mc, key, &mutation->after, false, &destination, &fallback_reason);
+      if (rc == MDBX_RESULT_TRUE)
+        BATCH_FALLBACK(fallback_reason);
+      if (unlikely(rc != MDBX_SUCCESS))
+        goto bailout;
+      if (unlikely(destination.leaf->pgno != location.leaf->pgno))
+        BATCH_FALLBACK(MDBX_BATCH_FALLBACK_MULTIPLE_LEAVES);
+      if (destination.exact && mc->clc->v.cmp(&mutation->before, &mutation->after) != 0)
+        BATCH_FALLBACK(MDBX_BATCH_FALLBACK_CONFLICT);
+    }
 
-    inner = &mc->subcur->cursor;
-    if (i && unlikely(inner->clc->k.cmp(&mutations[i - 1].before, &mutation->before) >= 0))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
-    const page_t *const leaf = inner->pg[inner->top];
-    slots[i].pgno = leaf->pgno;
-    slots[i].slot = inner->ki[inner->top];
-    if (unlikely(i && slots[i - 1].pgno == slots[i].pgno && slots[i - 1].slot >= slots[i].slot))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
+    slots[i].pgno = location.leaf->pgno;
+    const MDBX_val located = batch_leaf_key(location.inner, location.leaf, location.slot);
+    slots[i].slot =
+        location.slot + (upsert && !location.exact && mc->clc->v.cmp(&anchor, &located) > 0);
+    slots[i].anchor = anchor;
   }
 
-  size_t page_count = 0;
+  /* Build every destination page before touching the transaction. Unsupported
+   * structural changes therefore remain atomic fallbacks. */
   for (size_t begin = 0; begin < mutation_count;) {
     size_t end = begin + 1;
     while (end < mutation_count && slots[end].pgno == slots[begin].pgno)
       ++end;
 
-    MDBX_val seek_key = *key;
-    MDBX_val seek_data = mutations[begin].before;
-    rc = cursor_ops(mc, &seek_key, &seek_data, MDBX_GET_BOTH);
+    batch_location_t location;
+    uint32_t fallback_reason = MDBX_BATCH_FALLBACK_NONE;
+    const bool anchor_exact = mutations[begin].op != MDBX_BATCH_UPSERT;
+    rc = batch_locate(mc, key, &slots[begin].anchor, anchor_exact, &location, &fallback_reason);
+    if (rc == MDBX_RESULT_TRUE)
+      BATCH_FALLBACK(fallback_reason);
     if (unlikely(rc != MDBX_SUCCESS))
       goto bailout;
-    inner = &mc->subcur->cursor;
-    const page_t *const leaf = inner->pg[inner->top];
-    if (unlikely(leaf->pgno != slots[begin].pgno))
+    inner = location.inner;
+    const page_t *const source = location.leaf;
+    if (unlikely(source->pgno != slots[begin].pgno))
       BATCH_FALLBACK(MDBX_BATCH_FALLBACK_MULTIPLE_LEAVES);
-    const size_t number = page_numkeys(leaf);
-    if (unlikely(slots[end - 1].slot >= number))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
-
-    /* Changing an edge key in a multi-level tree may require changing a
-     * separator in the parent. Keep the first reference fast path local to a
-     * leaf and let the caller fall back for those boundary cases. */
-    if (inner->tree->height > 1 && (slots[begin].slot == 0 || slots[end - 1].slot + 1 == number))
-      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
-
-    MDBX_val previous = {nullptr, 0};
-    size_t mutation_index = begin;
-    for (size_t slot = 0; slot < number; ++slot) {
-      MDBX_val candidate;
-      if (mutation_index < end && slots[mutation_index].slot == slot) {
-        candidate = mutations[mutation_index++].after;
-      } else if (is_dupfix_leaf(leaf)) {
-        candidate = page_dupfix_key(leaf, slot, inner->tree->dupfix_size);
-      } else {
-        candidate = get_key(page_node(leaf, slot));
-      }
-      if (slot && unlikely(inner->clc->k.cmp(&previous, &candidate) >= 0))
-        BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
-      previous = candidate;
+    const size_t source_nkeys = page_numkeys(source);
+    if (unlikely(source_nkeys > PTRDIFF_MAX / sizeof(MDBX_val) ||
+                 end - begin > PTRDIFF_MAX / sizeof(MDBX_val) - source_nkeys)) {
+      rc = MDBX_TOO_LARGE;
+      goto bailout;
     }
-    ++page_count;
+    MDBX_val *const final_keys = osal_malloc((source_nkeys + end - begin) * sizeof(MDBX_val));
+    if (unlikely(final_keys == nullptr)) {
+      rc = MDBX_ENOMEM;
+      goto bailout;
+    }
+
+    size_t final_count = 0;
+    size_t mutation_index = begin;
+    for (size_t slot = 0; slot <= source_nkeys; ++slot) {
+      while (mutation_index < end && slots[mutation_index].slot == slot &&
+             mutations[mutation_index].op == MDBX_BATCH_UPSERT)
+        final_keys[final_count++] = mutations[mutation_index++].after;
+      if (slot == source_nkeys)
+        break;
+
+      if (mutation_index < end && slots[mutation_index].slot == slot) {
+        const MDBX_batch_mutation *const mutation = &mutations[mutation_index++];
+        if (unlikely(mutation->op == MDBX_BATCH_UPSERT)) {
+          osal_free(final_keys);
+          BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
+        }
+        if (mutation->op == MDBX_BATCH_REPLACE)
+          final_keys[final_count++] = mutation->after;
+      } else {
+        final_keys[final_count++] = batch_leaf_key(inner, source, slot);
+      }
+    }
+    if (unlikely(mutation_index != end)) {
+      osal_free(final_keys);
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
+    }
+    if (unlikely(final_count == 0)) {
+      osal_free(final_keys);
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_EMPTY_PAGE);
+    }
+
+    size_t destination_bytes = 0;
+    MDBX_val empty = {nullptr, 0};
+    for (size_t i = 0; i < final_count; ++i) {
+      if (i && unlikely(inner->clc->k.cmp(&final_keys[i - 1], &final_keys[i]) >= 0)) {
+        osal_free(final_keys);
+        BATCH_FALLBACK(MDBX_BATCH_FALLBACK_ORDER);
+      }
+      if (is_dupfix_leaf(source)) {
+        if (unlikely(final_keys[i].iov_len != inner->tree->dupfix_size)) {
+          osal_free(final_keys);
+          BATCH_FALLBACK(MDBX_BATCH_FALLBACK_VALUE_SIZE);
+        }
+        destination_bytes += inner->tree->dupfix_size;
+      } else {
+        destination_bytes += leaf_size(mc->txn->env, &final_keys[i], &empty);
+      }
+    }
+    if (unlikely(destination_bytes > page_space(mc->txn->env))) {
+      osal_free(final_keys);
+      BATCH_FALLBACK(MDBX_BATCH_FALLBACK_PAGE_FULL);
+    }
+
+    page_t *const destination = page_shadow_alloc(mc->txn, 1);
+    if (unlikely(destination == nullptr)) {
+      osal_free(final_keys);
+      rc = MDBX_ENOMEM;
+      goto bailout;
+    }
+    memset(destination, 0, mc->txn->env->ps);
+    destination->txnid = source->txnid;
+    destination->dupfix_ksize = source->dupfix_ksize;
+    destination->flags = source->flags;
+    destination->lower = 0;
+    destination->upper = (indx_t)(mc->txn->env->ps - PAGEHDRSZ);
+    destination->pgno = source->pgno;
+
+    MDBX_cursor builder = *inner;
+    builder.pg[builder.top] = destination;
+    builder.ki[builder.top] = 0;
+    for (size_t i = 0; i < final_count; ++i) {
+      rc = is_dupfix_leaf(destination) ? node_add_dupfix(&builder, i, &final_keys[i])
+                                       : node_add_leaf(&builder, i, &final_keys[i], &empty, 0);
+      if (unlikely(rc != MDBX_SUCCESS)) {
+        page_shadow_release(mc->txn->env, destination, 1);
+        osal_free(final_keys);
+        goto bailout;
+      }
+    }
+
+    batch_page_plan_t *const plan = &plans[plan_count++];
+    plan->source_pgno = source->pgno;
+    plan->mutation_index = begin;
+    plan->source_nkeys = source_nkeys;
+    plan->destination_nkeys = final_count;
+    plan->source_bytes = page_used(mc->txn->env, source);
+    plan->destination_bytes = page_used(mc->txn->env, destination);
+    plan->anchor_exact = anchor_exact;
+    const MDBX_val source_first = batch_leaf_key(inner, source, 0);
+    const MDBX_val destination_first = batch_leaf_key(&builder, destination, 0);
+    plan->first_changed = inner->clc->k.cmp(&source_first, &destination_first) != 0;
+    plan->destination = destination;
+    osal_free(final_keys);
     begin = end;
   }
 
   /* Copy the outer path once so nested-tree metadata can be published. Each
-   * affected inner leaf path is then copied once and all replacements for that
-   * leaf are written into its already-dirtied image. */
-  rc = cursor_touch(mc, key, &mutations[mutation_count - 1].after);
+   * affected inner path is copied once and receives one already-packed final
+   * page image. */
+  MDBX_val touch_data = mutations[mutation_count - 1].after.iov_len
+                            ? mutations[mutation_count - 1].after
+                            : mutations[mutation_count - 1].before;
+  rc = cursor_touch(mc, key, &touch_data);
   if (unlikely(rc != MDBX_SUCCESS))
     goto bailout;
-  for (size_t begin = 0; begin < mutation_count;) {
-    size_t end = begin + 1;
-    while (end < mutation_count && slots[end].pgno == slots[begin].pgno)
-      ++end;
-
-    MDBX_val seek_key = *key;
-    MDBX_val seek_data = mutations[begin].before;
-    rc = cursor_ops(mc, &seek_key, &seek_data, MDBX_GET_BOTH);
-    if (unlikely(rc != MDBX_SUCCESS)) {
+  for (size_t p = 0; p < plan_count; ++p) {
+    batch_page_plan_t *const plan = &plans[p];
+    batch_location_t location;
+    uint32_t fallback_reason = MDBX_BATCH_FALLBACK_NONE;
+    rc = batch_locate(mc, key, &slots[plan->mutation_index].anchor, plan->anchor_exact, &location,
+                      &fallback_reason);
+    if (unlikely(rc != MDBX_SUCCESS || location.leaf->pgno != plan->source_pgno)) {
       mc->txn->flags |= MDBX_TXN_ERROR;
+      rc = (rc == MDBX_SUCCESS || rc == MDBX_RESULT_TRUE) ? MDBX_PROBLEM : rc;
       goto bailout;
     }
-    inner = &mc->subcur->cursor;
+    inner = location.inner;
     rc = cursor_touch(inner, nullptr, nullptr);
     if (unlikely(rc != MDBX_SUCCESS)) {
       mc->txn->flags |= MDBX_TXN_ERROR;
@@ -9087,15 +9294,38 @@ int mdbx_cursor_mutate_batch(MDBX_cursor *mc, const MDBX_val *key, const MDBX_ba
     }
 
     page_t *const leaf = inner->pg[inner->top];
-    for (size_t i = begin; i < end; ++i) {
-      const MDBX_val *const after = &mutations[i].after;
-      if (is_dupfix_leaf(leaf)) {
-        memcpy(page_dupfix_ptr(leaf, slots[i].slot, inner->tree->dupfix_size), after->iov_base, after->iov_len);
-      } else {
-        node_t *const node = page_node(leaf, slots[i].slot);
-        cASSERT(inner, node_flags(node) == 0 && node_ds(node) == 0 && node_ks(node) == after->iov_len);
-        memcpy(node_key(node), after->iov_base, after->iov_len);
+    const uint64_t txnid = leaf->txnid;
+    const pgno_t pgno = leaf->pgno;
+    const uint16_t flags = leaf->flags;
+    memcpy(leaf, plan->destination, mc->txn->env->ps);
+    leaf->txnid = txnid;
+    leaf->pgno = pgno;
+    leaf->flags = flags;
+    if (plan->destination_nkeys >= plan->source_nkeys)
+      inner->tree->items += plan->destination_nkeys - plan->source_nkeys;
+    else
+      inner->tree->items -= plan->source_nkeys - plan->destination_nkeys;
+    inner->ki[inner->top] = 0;
+    inner->flags &= ~z_after_delete;
+    be_filled(inner);
+
+    if (plan->first_changed && inner->top > 0) {
+      MDBX_val first = batch_leaf_key(inner, leaf, 0);
+      size_t depth = 1;
+      inner->top--;
+      while (inner->top && !inner->ki[inner->top]) {
+        inner->top--;
+        ++depth;
       }
+      if (inner->ki[inner->top]) {
+        rc = tree_propagate_key(inner, &first);
+        if (unlikely(rc != MDBX_SUCCESS)) {
+          inner->top += (uint8_t)depth;
+          mc->txn->flags |= MDBX_TXN_ERROR;
+          goto bailout;
+        }
+      }
+      inner->top += (uint8_t)depth;
     }
 
     /* page_touch() may change the nested tree root while copying a clean path.
@@ -9106,15 +9336,18 @@ int mdbx_cursor_mutate_batch(MDBX_cursor *mc, const MDBX_val *key, const MDBX_ba
     cASSERT(mc, (node_flags(outer_node) & (N_DUP | N_TREE)) == (N_DUP | N_TREE));
     mc->subcur->nested_tree.mod_txnid = mc->txn->txnid;
     memcpy(node_data(outer_node), &mc->subcur->nested_tree, sizeof(tree_t));
-    begin = end;
+    page_shadow_release(mc->txn->env, plan->destination, 1);
+    plan->destination = nullptr;
   }
 
   {
     result->mutations_applied = mutation_count;
-    result->source_pages = page_count;
-    result->destination_pages = page_count;
-    result->source_bytes = page_count * mc->txn->env->ps;
-    result->destination_bytes = page_count * mc->txn->env->ps;
+    result->source_pages = plan_count;
+    result->destination_pages = plan_count;
+    for (size_t p = 0; p < plan_count; ++p) {
+      result->source_bytes += plans[p].source_bytes;
+      result->destination_bytes += plans[p].destination_bytes;
+    }
   }
 
   if (AUDIT_ENABLED()) {
@@ -9131,7 +9364,12 @@ int mdbx_cursor_mutate_batch(MDBX_cursor *mc, const MDBX_val *key, const MDBX_ba
   }
 
 bailout:
+  if (plans)
+    for (size_t p = 0; p < plan_count; ++p)
+      if (plans[p].destination)
+        page_shadow_release(mc->txn->env, plans[p].destination, 1);
   osal_free(slots);
+  osal_free(plans);
 #undef BATCH_FALLBACK
   return LOG_IFERR(rc);
 }

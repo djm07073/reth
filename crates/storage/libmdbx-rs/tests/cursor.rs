@@ -72,52 +72,168 @@ fn test_get_dup() {
     assert_eq!(cursor.last().unwrap(), Some((*b"key1", *b"val3")));
 }
 
-#[test]
-fn test_mutate_batch_replaces_same_leaf_duplicates() {
-    fn value(index: u32, payload: u32) -> [u8; 8] {
-        let mut value = [0u8; 8];
-        value[..4].copy_from_slice(&index.to_be_bytes());
-        value[4..].copy_from_slice(&payload.to_be_bytes());
-        value
-    }
+fn batch_value(index: u32, payload_len: usize, fill: u8) -> Vec<u8> {
+    let mut value = vec![fill; 4 + payload_len];
+    value[..4].copy_from_slice(&index.to_be_bytes());
+    value
+}
 
+#[test]
+fn test_mutate_batch_builds_final_leaf_for_mixed_variable_size_mutations() {
     let dir = tempdir().unwrap();
     let env = Environment::builder().open(dir.path()).unwrap();
     let txn = env.begin_rw_txn().unwrap();
     let dbi = txn.create_db(None, DatabaseFlags::DUP_SORT).unwrap().dbi();
-    let values = (0..500).map(|index| value(index, 0)).collect::<Vec<_>>();
+    let values = (0..500).map(|index| batch_value(index * 2, 8, 0)).collect::<Vec<_>>();
     for entry in &values {
         txn.put(dbi, b"outer-key", entry, WriteFlags::NO_DUP_DATA).unwrap();
     }
+    txn.commit().unwrap();
 
-    let after_100 = value(100, 0x1111_1111);
-    let after_101 = value(101, 0x2222_2222);
+    // Exercise a clean COW path and mix all logical operation kinds in one
+    // ordered stream. The replacement is deliberately larger than its source.
+    let txn = env.begin_rw_txn().unwrap();
+    let after_100 = batch_value(200, 48, 0x11);
+    let inserted_203 = batch_value(203, 19, 0x22);
     let mut cursor = txn.cursor(dbi).unwrap();
     let outcome = cursor
         .mutate_batch(
             b"outer-key",
             &[
-                BatchMutation { before: &values[100], after: &after_100 },
-                BatchMutation { before: &values[101], after: &after_101 },
+                BatchMutation::Replace { before: &values[100], after: &after_100 },
+                BatchMutation::Delete { before: &values[101] },
+                BatchMutation::Upsert { after: &inserted_203 },
             ],
         )
         .unwrap();
     let BatchOutcome::Applied(result) = outcome else {
         panic!("expected the nested-leaf fast path, got {outcome:?}")
     };
-    assert_eq!(result.mutations_applied, 2);
+    assert_eq!(result.mutations_applied, 3);
     assert_eq!(result.source_pages, 1);
     assert_eq!(result.destination_pages, result.source_pages);
     assert!(result.source_bytes > 0);
-    assert_eq!(result.destination_bytes, result.source_bytes);
+    assert_ne!(result.destination_bytes, result.source_bytes);
     assert!(cursor.get_both::<()>(b"outer-key", &after_100).unwrap().is_some());
     assert!(cursor.get_both::<()>(b"outer-key", &values[100]).unwrap().is_none());
+    assert!(cursor.get_both::<()>(b"outer-key", &values[101]).unwrap().is_none());
+    assert!(cursor.get_both::<()>(b"outer-key", &inserted_203).unwrap().is_some());
     drop(cursor);
     txn.commit().unwrap();
 
     let txn = env.begin_ro_txn().unwrap();
     let mut cursor = txn.cursor(dbi).unwrap();
-    assert!(cursor.get_both::<()>(b"outer-key", &after_101).unwrap().is_some());
+    assert!(cursor.get_both::<()>(b"outer-key", &after_100).unwrap().is_some());
+    assert!(cursor.get_both::<()>(b"outer-key", &inserted_203).unwrap().is_some());
+}
+
+#[test]
+fn test_mutate_batch_page_full_fallback_is_atomic() {
+    let dir = tempdir().unwrap();
+    let env = Environment::builder().open(dir.path()).unwrap();
+    let txn = env.begin_rw_txn().unwrap();
+    let dbi = txn.create_db(None, DatabaseFlags::DUP_SORT).unwrap().dbi();
+    let values = (0..500).map(|index| batch_value(index * 2, 8, 0)).collect::<Vec<_>>();
+    for entry in &values {
+        txn.put(dbi, b"outer-key", entry, WriteFlags::NO_DUP_DATA).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = env.begin_rw_txn().unwrap();
+    let oversized = batch_value(200, 7_000, 0x44);
+    let mut cursor = txn.cursor(dbi).unwrap();
+    let outcome = cursor
+        .mutate_batch(
+            b"outer-key",
+            &[BatchMutation::Replace { before: &values[100], after: &oversized }],
+        )
+        .unwrap();
+    assert_eq!(outcome, BatchOutcome::Unsupported(BatchFallbackReason::PageFull));
+    assert!(cursor.get_both::<()>(b"outer-key", &values[100]).unwrap().is_some());
+    assert!(cursor.get_both::<()>(b"outer-key", &oversized).unwrap().is_none());
+}
+
+#[test]
+fn test_mutate_batch_peer_cursor_fallback_is_atomic() {
+    let dir = tempdir().unwrap();
+    let env = Environment::builder().open(dir.path()).unwrap();
+    let txn = env.begin_rw_txn().unwrap();
+    let dbi = txn.create_db(None, DatabaseFlags::DUP_SORT).unwrap().dbi();
+    let values = (0..500).map(|index| batch_value(index, 8, 0)).collect::<Vec<_>>();
+    for entry in &values {
+        txn.put(dbi, b"outer-key", entry, WriteFlags::NO_DUP_DATA).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = env.begin_rw_txn().unwrap();
+    let mut peer = txn.cursor(dbi).unwrap();
+    assert!(peer.get_both::<()>(b"outer-key", &values[100]).unwrap().is_some());
+    let replacement = batch_value(100, 24, 0x77);
+    let mut cursor = txn.cursor(dbi).unwrap();
+    let outcome = cursor
+        .mutate_batch(
+            b"outer-key",
+            &[BatchMutation::Replace { before: &values[100], after: &replacement }],
+        )
+        .unwrap();
+    assert_eq!(outcome, BatchOutcome::Unsupported(BatchFallbackReason::PeerCursor));
+    assert!(cursor.get_both::<()>(b"outer-key", &values[100]).unwrap().is_some());
+    assert!(cursor.get_both::<()>(b"outer-key", &replacement).unwrap().is_none());
+}
+
+#[test]
+fn test_mutate_batch_repeated_mixed_updates_in_one_write_transaction() {
+    let dir = tempdir().unwrap();
+    let env = Environment::builder().open(dir.path()).unwrap();
+    let txn = env.begin_rw_txn().unwrap();
+    let dbi = txn.create_db(None, DatabaseFlags::DUP_SORT).unwrap().dbi();
+    let values = (0..1_000).map(|index| batch_value(index * 2, 8, 0)).collect::<Vec<_>>();
+    for entry in &values {
+        txn.put(dbi, b"outer-key", entry, WriteFlags::NO_DUP_DATA).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = env.begin_rw_txn().unwrap();
+    let mut cursor = txn.cursor(dbi).unwrap();
+    let mut replacements = Vec::new();
+    let mut insertions = Vec::new();
+    for round in 0..50 {
+        let base = round * 10;
+        let after = batch_value((base * 2) as u32, 16 + round, 0x55);
+        let inserted = batch_value((base * 2 + 3) as u32, 9 + round, 0x66);
+        let outcome = cursor
+            .mutate_batch(
+                b"outer-key",
+                &[
+                    BatchMutation::Replace { before: &values[base], after: &after },
+                    BatchMutation::Delete { before: &values[base + 1] },
+                    BatchMutation::Upsert { after: &inserted },
+                ],
+            )
+            .unwrap();
+        if matches!(outcome, BatchOutcome::Unsupported(_)) {
+            assert!(cursor.get_both::<()>(b"outer-key", &values[base]).unwrap().is_some());
+            cursor.del(WriteFlags::CURRENT).unwrap();
+            cursor.put(b"outer-key", &after, WriteFlags::NO_DUP_DATA).unwrap();
+            assert!(cursor.get_both::<()>(b"outer-key", &values[base + 1]).unwrap().is_some());
+            cursor.del(WriteFlags::CURRENT).unwrap();
+            cursor.put(b"outer-key", &inserted, WriteFlags::NO_DUP_DATA).unwrap();
+        }
+        replacements.push(after);
+        insertions.push(inserted);
+    }
+    drop(cursor);
+    txn.commit().unwrap();
+
+    let txn = env.begin_ro_txn().unwrap();
+    let mut cursor = txn.cursor(dbi).unwrap();
+    for round in 0..50 {
+        let base = round * 10;
+        assert!(cursor.get_both::<()>(b"outer-key", &values[base]).unwrap().is_none());
+        assert!(cursor.get_both::<()>(b"outer-key", &values[base + 1]).unwrap().is_none());
+        assert!(cursor.get_both::<()>(b"outer-key", &replacements[round]).unwrap().is_some());
+        assert!(cursor.get_both::<()>(b"outer-key", &insertions[round]).unwrap().is_some());
+    }
 }
 
 #[test]

@@ -5669,15 +5669,19 @@ LIBMDBX_API int mdbx_cursor_get_batch(MDBX_cursor *cursor, size_t *count, MDBX_v
 
 /** Operation kinds accepted by \ref mdbx_cursor_mutate_batch(). */
 typedef enum MDBX_batch_mutation_op {
-  /** Replace one exact duplicate value while preserving duplicate ordering. */
-  MDBX_BATCH_REPLACE = 1
+  /** Replace one exact duplicate value. */
+  MDBX_BATCH_REPLACE = 1,
+  /** Delete one exact duplicate value. */
+  MDBX_BATCH_DELETE = 2,
+  /** Insert one duplicate value which does not already exist. */
+  MDBX_BATCH_UPSERT = 3
 } MDBX_batch_mutation_op;
 
 /** One mutation for \ref mdbx_cursor_mutate_batch().
  *
- * The reference fast path accepts same-size replacements for one DUPSORT
- * outer key. `before` identifies the exact existing duplicate and `after`
- * contains its replacement. */
+ * `before` identifies an exact existing duplicate for replace/delete.
+ * `after` contains the final duplicate value for replace/upsert. The unused
+ * value must be empty. */
 typedef struct MDBX_batch_mutation {
   MDBX_val before;
   MDBX_val after;
@@ -5694,7 +5698,11 @@ typedef enum MDBX_batch_fallback_reason {
   MDBX_BATCH_FALLBACK_NOT_FOUND = 4,
   MDBX_BATCH_FALLBACK_MULTIPLE_LEAVES = 5,
   MDBX_BATCH_FALLBACK_SUBPAGE = 6,
-  MDBX_BATCH_FALLBACK_ORDER = 7
+  MDBX_BATCH_FALLBACK_ORDER = 7,
+  MDBX_BATCH_FALLBACK_PAGE_FULL = 8,
+  MDBX_BATCH_FALLBACK_EMPTY_PAGE = 9,
+  MDBX_BATCH_FALLBACK_CONFLICT = 10,
+  MDBX_BATCH_FALLBACK_PEER_CURSOR = 11
 } MDBX_batch_fallback_reason;
 
 /** Result counters for \ref mdbx_cursor_mutate_batch(). */
@@ -5708,18 +5716,20 @@ typedef struct MDBX_batch_result {
   uint32_t reserved;
 } MDBX_batch_result;
 
-/** Try to apply ordered replacements for one DUPSORT key as page-local mutations.
+/** Try to apply an ordered mutation stream for one DUPSORT key as final-page mutations.
  *
  * The function validates the complete batch before touching database pages.
  * It returns `MDBX_RESULT_TRUE` with `result->fallback_reason` set when the
  * batch is not supported by the fast path; callers may then use ordinary
  * cursor operations. No mutation is applied on this fallback return.
  *
- * The reference fast path supports exact, same-size replacements that resolve
- * to nested DUPSORT leaf pages. It touches the outer cursor path once and each
- * affected nested leaf path once, validates final duplicate ordering,
- * overwrites the leaf entries, and reuses MDBX's existing dirty-page and
- * commit machinery.
+ * The final-page path supports delete, insert and variable-size replacement
+ * mutations that resolve to nested DUPSORT leaf pages. It validates and packs
+ * all destination leaf images before mutation, touches the outer cursor path
+ * once and each affected nested leaf path once, then installs each packed page
+ * while reusing MDBX's existing dirty-page and commit machinery. A mutation
+ * stream requiring an additional leaf or removing a whole leaf falls back
+ * atomically so the ordinary split/merge path retains structural ownership.
  */
 LIBMDBX_API int mdbx_cursor_mutate_batch(MDBX_cursor *cursor, const MDBX_val *key,
                                          const MDBX_batch_mutation *mutations,

@@ -117,8 +117,8 @@ pub enum DatabaseWriteOperation {
     CursorUpsert,
     /// Update the row at the current cursor position.
     CursorUpdateCurrent,
-    /// Replace duplicate rows through the page-batch API.
-    CursorBatchReplace,
+    /// Apply duplicate mutations through the final-page batch API.
+    CursorBatchMutate,
     /// Insert cursor.
     CursorInsert,
     /// Append duplicate cursor.

@@ -37,7 +37,7 @@ use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_api::{
     cursor::{
-        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchOutcome, DupBatchReplacement,
+        DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchMutation, DupBatchOutcome,
     },
     database::{Database, ReaderTxnTracker},
     models::{
@@ -2683,9 +2683,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 hashed_storage_cursor.delete_current_duplicates()?;
             }
 
-            let mut replacements = Vec::new();
-            let mut deletes = Vec::new();
-            let mut upserts = Vec::new();
+            let mut mutations = Vec::new();
             for (hashed_slot, value) in storage.storage_slots_ref() {
                 let entry = StorageEntry { key: *hashed_slot, value: *value };
 
@@ -2699,41 +2697,42 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 };
 
                 match (existing, entry.value.is_zero()) {
-                    (Some(_), true) => deletes.push(entry.key),
+                    (Some(before), true) => mutations.push(DupBatchMutation::Delete { before }),
                     (Some(before), false) => {
-                        replacements.push(DupBatchReplacement { before, after: entry })
+                        mutations.push(DupBatchMutation::Replace { before, after: entry })
                     }
-                    (None, false) => upserts.push(entry),
+                    (None, false) => mutations.push(DupBatchMutation::Upsert { after: entry }),
                     (None, true) => {}
                 }
             }
 
-            if !replacements.is_empty() &&
+            if !mutations.is_empty() &&
                 matches!(
-                    hashed_storage_cursor
-                        .replace_duplicates_batch(*hashed_address, &replacements)?,
+                    hashed_storage_cursor.mutate_duplicates_batch(*hashed_address, &mutations)?,
                     DupBatchOutcome::Unsupported(_)
                 )
             {
-                for replacement in &replacements {
-                    let current = hashed_storage_cursor
-                        .seek_by_key_subkey(*hashed_address, replacement.before.key)?;
-                    if current.as_ref().is_some_and(|entry| entry.key == replacement.before.key) {
-                        hashed_storage_cursor
-                            .update_current(*hashed_address, &replacement.after)?;
+                for mutation in mutations {
+                    match mutation {
+                        DupBatchMutation::Delete { before } => {
+                            let current = hashed_storage_cursor
+                                .seek_by_key_subkey(*hashed_address, before.key)?;
+                            if current.as_ref().is_some_and(|entry| entry.key == before.key) {
+                                hashed_storage_cursor.delete_current()?;
+                            }
+                        }
+                        DupBatchMutation::Upsert { after } => {
+                            hashed_storage_cursor.upsert(*hashed_address, &after)?;
+                        }
+                        DupBatchMutation::Replace { before, after } => {
+                            let current = hashed_storage_cursor
+                                .seek_by_key_subkey(*hashed_address, before.key)?;
+                            if current.as_ref().is_some_and(|entry| entry.key == before.key) {
+                                hashed_storage_cursor.update_current(*hashed_address, &after)?;
+                            }
+                        }
                     }
                 }
-            }
-
-            for hashed_slot in deletes {
-                let current =
-                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, hashed_slot)?;
-                if current.as_ref().is_some_and(|entry| entry.key == hashed_slot) {
-                    hashed_storage_cursor.delete_current()?;
-                }
-            }
-            for entry in upserts {
-                hashed_storage_cursor.upsert(*hashed_address, &entry)?;
             }
         }
 

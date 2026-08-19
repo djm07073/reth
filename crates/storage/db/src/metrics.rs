@@ -139,7 +139,7 @@ impl DatabaseEnvMetrics {
     pub(crate) fn record_page_batch_applied(
         &self,
         table: &'static str,
-        replacements: usize,
+        mutations: usize,
         source_pages: usize,
         destination_pages: usize,
         source_bytes: usize,
@@ -147,8 +147,8 @@ impl DatabaseEnvMetrics {
     ) {
         metrics::counter!("database.page_batch.attempts_total", "table" => table).increment(1);
         metrics::counter!("database.page_batch.applied_total", "table" => table).increment(1);
-        metrics::counter!("database.page_batch.replacements_total", "table" => table)
-            .increment(replacements as u64);
+        metrics::counter!("database.page_batch.mutations_total", "table" => table)
+            .increment(mutations as u64);
         metrics::counter!("database.page_batch.source_pages_total", "table" => table)
             .increment(source_pages as u64);
         metrics::counter!("database.page_batch.destination_pages_total", "table" => table)
@@ -269,7 +269,7 @@ pub(crate) enum Operation {
     /// Database cursor update-current operation.
     CursorUpdateCurrent,
     /// Database duplicate page-batch replacement operation.
-    CursorBatchReplace,
+    CursorBatchMutate,
     /// Database cursor insert operation.
     CursorInsert,
     /// Database cursor append operation.
@@ -298,7 +298,7 @@ impl Operation {
             Self::Delete => "delete",
             Self::CursorUpsert => "cursor-upsert",
             Self::CursorUpdateCurrent => "cursor-update-current",
-            Self::CursorBatchReplace => "cursor-batch-replace",
+            Self::CursorBatchMutate => "cursor-batch-mutate",
             Self::CursorInsert => "cursor-insert",
             Self::CursorAppend => "cursor-append",
             Self::CursorAppendDup => "cursor-append-dup",

@@ -9,8 +9,8 @@ use reth_db_api::{
     common::{PairResult, ValueOnlyResult},
     cursor::{
         DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchFallbackReason,
-        DupBatchOutcome, DupBatchReplacement, DupBatchResult, DupWalker, RangeWalker,
-        ReverseWalker, Walker,
+        DupBatchMutation, DupBatchOutcome, DupBatchResult, DupWalker, RangeWalker, ReverseWalker,
+        Walker,
     },
     table::{Compress, Decode, Decompress, DupSort, Encode, IntoVec, Table},
 };
@@ -20,9 +20,17 @@ use reth_libmdbx::{
 };
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
 use std::{
-    borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds, sync::Arc,
+    borrow::Cow,
+    collections::Bound,
+    marker::PhantomData,
+    ops::RangeBounds,
+    sync::{Arc, LazyLock},
     time::Instant,
 };
+
+static MDBX_FINAL_PAGE_BATCH_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    !matches!(std::env::var("RETH_MDBX_FINAL_PAGE_BATCH").as_deref(), Ok("0" | "false" | "off"))
+});
 
 /// Read only Cursor.
 pub type CursorRO<T> = Cursor<RO, T>;
@@ -449,47 +457,72 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
 }
 
 impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
-    fn replace_duplicates_batch(
+    fn mutate_duplicates_batch(
         &mut self,
         key: T::Key,
-        replacements: &[DupBatchReplacement<T::Value>],
+        mutations: &[DupBatchMutation<T::Value>],
     ) -> Result<DupBatchOutcome, DatabaseError> {
+        if !*MDBX_FINAL_PAGE_BATCH_ENABLED {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_page_batch_fallback(T::NAME, "disabled");
+            }
+            return Ok(DupBatchOutcome::Unsupported(DupBatchFallbackReason::UnsupportedOperation));
+        }
         let key = key.encode();
         let serialization_start = Instant::now();
-        let encoded = replacements
+        enum EncodedMutation {
+            Delete(Vec<u8>),
+            Upsert(Vec<u8>),
+            Replace(Vec<u8>, Vec<u8>),
+        }
+        let encode = |value: &T::Value| {
+            if let Some(value) = value.uncompressable_ref() {
+                value.to_vec()
+            } else {
+                let mut buf = Vec::new();
+                value.compress_to_buf(&mut buf);
+                buf
+            }
+        };
+        let encoded = mutations
             .iter()
-            .map(|replacement| {
-                let encode = |value: &T::Value| {
-                    if let Some(value) = value.uncompressable_ref() {
-                        value.to_vec()
-                    } else {
-                        let mut buf = Vec::new();
-                        value.compress_to_buf(&mut buf);
-                        buf
-                    }
-                };
-                (encode(&replacement.before), encode(&replacement.after))
+            .map(|mutation| match mutation {
+                DupBatchMutation::Delete { before } => EncodedMutation::Delete(encode(before)),
+                DupBatchMutation::Upsert { after } => EncodedMutation::Upsert(encode(after)),
+                DupBatchMutation::Replace { before, after } => {
+                    EncodedMutation::Replace(encode(before), encode(after))
+                }
             })
             .collect::<Vec<_>>();
-        let serialized_size =
-            encoded.iter().map(|(before, after)| before.len() + after.len()).sum::<usize>();
+        let serialized_size = encoded
+            .iter()
+            .map(|mutation| match mutation {
+                EncodedMutation::Delete(before) => before.len(),
+                EncodedMutation::Upsert(after) => after.len(),
+                EncodedMutation::Replace(before, after) => before.len() + after.len(),
+            })
+            .sum::<usize>();
         self.record_serialization(
-            Operation::CursorBatchReplace,
+            Operation::CursorBatchMutate,
             serialization_start.elapsed(),
             serialized_size,
         );
         let mutations = encoded
             .iter()
-            .map(|(before, after)| BatchMutation { before, after })
+            .map(|mutation| match mutation {
+                EncodedMutation::Delete(before) => BatchMutation::Delete { before },
+                EncodedMutation::Upsert(after) => BatchMutation::Upsert { after },
+                EncodedMutation::Replace(before, after) => BatchMutation::Replace { before, after },
+            })
             .collect::<Vec<_>>();
         let outcome = self.execute_with_operation_metric(
-            Operation::CursorBatchReplace,
+            Operation::CursorBatchMutate,
             Some(key.as_ref().len() + serialized_size),
             |this| {
                 this.inner.mutate_batch(key.as_ref(), &mutations).map_err(|e| {
                     DatabaseError::from(DatabaseWriteError {
                         info: e.into(),
-                        operation: DatabaseWriteOperation::CursorBatchReplace,
+                        operation: DatabaseWriteOperation::CursorBatchMutate,
                         table_name: T::NAME,
                         key: key.as_ref().to_vec(),
                     })
@@ -500,7 +533,7 @@ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
         Ok(match outcome {
             MDBXBatchOutcome::Applied(result) => {
                 self.record_operation_result_bytes(
-                    Operation::CursorBatchReplace,
+                    Operation::CursorBatchMutate,
                     result.destination_bytes,
                 );
                 if let Some(metrics) = &self.metrics {
@@ -514,7 +547,7 @@ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
                     );
                 }
                 DupBatchOutcome::Applied(DupBatchResult {
-                    replacements_applied: result.mutations_applied,
+                    mutations_applied: result.mutations_applied,
                     source_pages: result.source_pages,
                     destination_pages: result.destination_pages,
                     source_bytes: result.source_bytes,
@@ -542,6 +575,18 @@ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
                         (DupBatchFallbackReason::Subpage, "subpage")
                     }
                     MDBXBatchFallbackReason::Order => (DupBatchFallbackReason::Order, "order"),
+                    MDBXBatchFallbackReason::PageFull => {
+                        (DupBatchFallbackReason::PageFull, "page-full")
+                    }
+                    MDBXBatchFallbackReason::EmptyPage => {
+                        (DupBatchFallbackReason::EmptyPage, "empty-page")
+                    }
+                    MDBXBatchFallbackReason::Conflict => {
+                        (DupBatchFallbackReason::Conflict, "conflict")
+                    }
+                    MDBXBatchFallbackReason::PeerCursor => {
+                        (DupBatchFallbackReason::PeerCursor, "peer-cursor")
+                    }
                     MDBXBatchFallbackReason::Unknown(reason) => {
                         (DupBatchFallbackReason::Unknown(reason), "unknown")
                     }
@@ -604,7 +649,7 @@ mod tests {
     };
     use alloy_primitives::{address, Address, B256, U256};
     use reth_db_api::{
-        cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW, DupBatchOutcome, DupBatchReplacement},
+        cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW, DupBatchMutation, DupBatchOutcome},
         models::{BlockNumberAddress, ClientVersion},
         table::TableImporter,
         transaction::{DbTx, DbTxMut},
@@ -653,18 +698,18 @@ mod tests {
         let after_100 = StorageEntry { key: slot(100), value: U256::from(2100) };
         let after_600 = StorageEntry { key: slot(600), value: U256::from(2600) };
         let outcome = cursor
-            .replace_duplicates_batch(
+            .mutate_duplicates_batch(
                 address,
                 &[
-                    DupBatchReplacement { before: entries[100], after: after_100 },
-                    DupBatchReplacement { before: entries[600], after: after_600 },
+                    DupBatchMutation::Replace { before: entries[100], after: after_100 },
+                    DupBatchMutation::Replace { before: entries[600], after: after_600 },
                 ],
             )
             .unwrap();
         let DupBatchOutcome::Applied(result) = outcome else {
             panic!("expected typed MDBX batch fast path, got {outcome:?}")
         };
-        assert_eq!(result.replacements_applied, 2);
+        assert_eq!(result.mutations_applied, 2);
         assert!(result.source_pages >= 2);
         assert_eq!(result.destination_pages, result.source_pages);
         assert_eq!(cursor.seek_by_key_subkey(address, slot(100)).unwrap(), Some(after_100));

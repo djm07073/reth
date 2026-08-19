@@ -7,7 +7,7 @@ use crate::{
     common::{IterPairResult, PairResult, ValueOnlyResult},
     cursor::{
         DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupBatchFallbackReason,
-        DupBatchOutcome, DupBatchReplacement, DupWalker, RangeWalker, ReverseWalker, Walker,
+        DupBatchMutation, DupBatchOutcome, DupWalker, RangeWalker, ReverseWalker, Walker,
     },
     database::Database,
     database_metrics::DatabaseMetrics,
@@ -400,10 +400,10 @@ impl<T: Table> DbCursorRW<T> for CursorMock {
 }
 
 impl<T: DupSort> DbDupCursorRW<T> for CursorMock {
-    fn replace_duplicates_batch(
+    fn mutate_duplicates_batch(
         &mut self,
         _key: <T>::Key,
-        _replacements: &[DupBatchReplacement<<T>::Value>],
+        _mutations: &[DupBatchMutation<<T>::Value>],
     ) -> Result<DupBatchOutcome, DatabaseError> {
         Ok(DupBatchOutcome::Unsupported(DupBatchFallbackReason::UnsupportedOperation))
     }

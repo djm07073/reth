@@ -190,6 +190,21 @@ def main() -> int:
             before, after, "reth_database_page_batch_attempts_total", table_label
         )
         applied = delta(before, after, "reth_database_page_batch_applied_total", table_label)
+        mutations = delta(
+            before,
+            after,
+            "reth_database_page_batch_mutations_total",
+            table_label,
+        )
+        # Keep old same-size-replacement runs reducible after the metric was
+        # generalized to delete/upsert/replace mutation streams.
+        if not mutations:
+            mutations = delta(
+                before,
+                after,
+                "reth_database_page_batch_replacements_total",
+                table_label,
+            )
         fallback_reasons = {}
         for (name, labels), value in after.items():
             label_map = dict(labels)
@@ -215,16 +230,7 @@ def main() -> int:
                 "attempts": int(round(attempts)),
                 "applied": int(round(applied)),
                 "applied_rate": applied / attempts if attempts else 0.0,
-                "replacements": int(
-                    round(
-                        delta(
-                            before,
-                            after,
-                            "reth_database_page_batch_replacements_total",
-                            table_label,
-                        )
-                    )
-                ),
+                "mutations": int(round(mutations)),
                 "source_pages": int(
                     round(
                         delta(

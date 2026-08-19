@@ -26,7 +26,7 @@ the generated amalgamation is already applied under `crates/storage/libmdbx-rs/m
 - `save_blocks` trie merge, account-trie write, storage-trie write, hashed-state write, and commit
   latency;
 - MDBX cursor seek/delete/upsert call count, duration, logical/result bytes, and serialization;
-- custom MDBX page-batch attempts, applied rate, replacements, pages, bytes, and fallback reasons;
+- custom MDBX page-batch attempts, applied rate, mutations, pages, bytes, and fallback reasons;
 - write-transaction dirty/retired bytes and MDBX newly/COW/clone/split/merge/spill/unspill/write/
   sync/prefault/mincore counters;
 - Samply CPU and context-switch/off-CPU stacks, with standalone SVG flame graphs.
@@ -157,11 +157,13 @@ the benchmark never depends on an external RPC endpoint.
 
 The proposed accelerator boundary and correctness gates are documented in
 [`docs/design/fpga-mdbx-page-mutation-accelerator.md`](../../docs/design/fpga-mdbx-page-mutation-accelerator.md).
-The implemented libMDBX CPU batch control, its failed discovery performance gate, and the required
-next final-page-builder design are documented in
+The implemented libMDBX CPU batch control, its failed discovery performance gate, and the broader
+final-page-builder result are documented in
 [`docs/design/cpu-page-batch-reference-engine.md`](../../docs/design/cpu-page-batch-reference-engine.md)
 and
-[`docs/design/cpu-page-batch-benchmark-report.md`](../../docs/design/cpu-page-batch-benchmark-report.md).
+[`docs/design/cpu-page-batch-benchmark-report.md`](../../docs/design/cpu-page-batch-benchmark-report.md),
+with the matched final-page benchmark and four retained flame graphs in
+[`docs/design/mdbx-final-page-builder-benchmark-report.md`](../../docs/design/mdbx-final-page-builder-benchmark-report.md).
 The accepted software COW candidate, fair batch-17/batch-33 comparison, and full 500-block
 confirmation are documented in
 [`docs/design/cow-transaction-batching-benchmark-report.md`](../../docs/design/cow-transaction-batching-benchmark-report.md).
